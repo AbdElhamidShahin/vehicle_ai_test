@@ -19,10 +19,12 @@ import 'package:record/record.dart';
 // so that Dart bakes the value in at compile time (AOT / tree-shaking).
 // A non-const call always returns the default ''.
 // ─────────────────────────────────────────────────────────────────────────────
-const String _geminiApiKey = String.fromEnvironment('');
-
+const String _geminiApiKey = String.fromEnvironment(
+  'GEMINI_API_KEY',
+  defaultValue: '',
+);
 // Gemini REST endpoint (no extra SDK needed — plain HTTP).
-const String _geminiModel = 'gemini-2.5-flash-lite';
+const String _geminiModel = 'gemini-3.5-flash-lite';
 const String _geminiEndpoint =
     'https://generativelanguage.googleapis.com/v1beta/models/'
     '$_geminiModel:generateContent';
