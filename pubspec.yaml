@@ -15,7 +15,9 @@ dependencies:
   record: ^6.1.2        # audio recording
   http: ^1.5.0          # REST calls to Gemini
   path_provider: ^2.1.5 # temp directory for audio file
-
+  share_plus: ^12.0.2
+  geolocator: ^14.0.2
+  url_launcher: ^6.3.2
 dev_dependencies:
   flutter_test:
     sdk: flutter
