@@ -18,9 +18,9 @@ dependencies:
   share_plus: ^12.0.2
   geolocator: ^14.0.2
   url_launcher: ^6.3.2
-  firebase_core: 4.12.0
-  firebase_ai: 3.14.0
-  firebase_app_check: 0.4.5+1
+  firebase_core: ^4.14.0
+  firebase_ai: ^4.0.0
+  firebase_app_check: ^0.4.7
 
 dev_dependencies:
   flutter_test:
