@@ -4,6 +4,7 @@ class VehicleResult {
   String plateNumber;
   String vehicleType;
   String address;
+
   final double? latitude;
   final double? longitude;
   String mapLink;

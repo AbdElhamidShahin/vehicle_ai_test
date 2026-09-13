@@ -1,90 +1,143 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:web_socket_channel/web_socket_channel.dart';
+import 'dart:io';
+import 'dart:typed_data';
 import 'package:record/record.dart';
 
 class DeepgramLiveService {
-  WebSocketChannel? _channel;
-  final _audioRecorder = AudioRecorder();
+  DeepgramLiveService({required this.apiKey});
 
-  // Stream لعرض اللوحات المستخرجة لحظياً
-  final _transcriptController = StreamController<String>.broadcast();
-  Stream<String> get onTranscript => _transcriptController.stream;
+  final String apiKey;
 
-  /// بدء البث الصوتي المباشر والاتصال بـ Deepgram Nova-2
-  Future<void> startStreaming(String apiKey) async {
-    if (apiKey.isEmpty) {
-      throw StateError('DEEPGRAM_API_KEY غير محدد');
+  WebSocket? _ws;
+  StreamSubscription? _wsSub;
+
+  final _recorder = AudioRecorder();
+  StreamSubscription<Uint8List>? _audioSub;
+
+  final _ctrl = StreamController<DeepgramTranscript>.broadcast();
+  Stream<DeepgramTranscript> get onTranscript => _ctrl.stream;
+
+  bool _running = false;
+  bool get isRunning => _running;
+
+  Future<void> start() async {
+    if (_running) return;
+    if (apiKey.isEmpty) throw StateError('Deepgram API key is empty');
+
+    if (!await _recorder.hasPermission()) {
+      throw StateError('Microphone permission denied');
     }
 
-    // رابط الـ WebSocket الرسمي لـ Deepgram Nova-2 مع اللغة العربية
-    final url = Uri.parse(
-      'wss://api.deepgram.com/v1/listen?model=nova-2&language=ar&encoding=linear16&sample_rate=16000&punctuate=true',
+    final uri = Uri.parse(
+      'wss://api.deepgram.com/v1/listen'
+          '?model=nova-2'
+          '&language=ar'
+          '&encoding=linear16'
+          '&sample_rate=16000'
+          '&channels=1'
+          '&interim_results=true'
+          '&endpointing=300'
+          '&punctuate=false',
     );
 
-    _channel = WebSocketChannel.connect(
-      url,
-      protocols: ['token', apiKey],
-    );
-
-    // الاستماع للبيانات القادمة من السيرفر
-    _channel!.stream.listen(
-          (message) {
-        _parseTranscript(message);
-      },
-      onError: (error) {
-        print('Deepgram WebSocket Error: $error');
-      },
-      onDone: () {
-        print('Deepgram WebSocket Closed');
-      },
-    );
-
-    // بدء التقاط الصوت من الميكروفون كـ PCM سريم
-    if (await _audioRecorder.hasPermission()) {
-      final audioStream = await _audioRecorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: 16000,
-          numChannels: 1,
-        ),
+    try {
+      // 💡 الحل المعتمد في المنصات التي ترفض الـ Headers المخصصة:
+      // تمرير المفتاح عبر الـ protocols (Sec-WebSocket-Protocol)
+      _ws = await WebSocket.connect(
+        uri.toString(),
+        protocols: ['token', apiKey],
       );
 
-      // إرسال الحزم الصوتية أول بأول للسيرفر
-      audioStream.listen((data) {
-        if (_channel != null) {
-          _channel!.sink.add(data);
-        }
-      });
+      _wsSub = _ws!.listen(
+        _onWsMessage,
+        onError: (e) => _ctrl.addError(e),
+        onDone: _onWsDone,
+        cancelOnError: false,
+      );
+    } catch (e) {
+      _running = false;
+      rethrow;
     }
+
+    final audioStream = await _recorder.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: 16000,
+        numChannels: 1,
+      ),
+    );
+
+    _audioSub = audioStream.listen(
+          (Uint8List chunk) {
+        if (_ws != null && _ws!.readyState == WebSocket.open) {
+          _ws!.add(chunk);
+        }
+      },
+      onError: (e) => _ctrl.addError(e),
+      cancelOnError: false,
+    );
+
+    _running = true;
   }
 
-  void _parseTranscript(dynamic message) {
+  Future<void> stop() async {
+    if (!_running) return;
+    _running = false;
+
+    await _audioSub?.cancel();
+    _audioSub = null;
     try {
-      final data = jsonDecode(message as String) as Map<String, dynamic>;
-      final channel = data['channel'] as Map<String, dynamic>?;
-      final alternatives = channel?['alternatives'] as List<dynamic>?;
+      await _recorder.stop();
+    } catch (_) {}
 
-      if (alternatives != null && alternatives.isNotEmpty) {
-        final transcript = alternatives[0]['transcript'] as String? ?? '';
-        final isFinal = data['is_final'] as bool? ?? false;
-
-        if (transcript.isNotEmpty && isFinal) {
-          _transcriptController.add(transcript.trim());
-        }
+    try {
+      if (_ws != null && _ws!.readyState == WebSocket.open) {
+        _ws!.add(jsonEncode({'type': 'CloseStream'}));
+        await Future<void>.delayed(const Duration(milliseconds: 400));
       }
+    } catch (_) {}
+
+    await _wsSub?.cancel();
+    _wsSub = null;
+    try {
+      await _ws?.close();
+    } catch (_) {}
+    _ws = null;
+  }
+
+  void _onWsMessage(dynamic raw) {
+    if (raw is! String) return;
+    try {
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+      if (data['type'] == 'Metadata') return;
+
+      final channel = data['channel'] as Map<String, dynamic>?;
+      final alts = channel?['alternatives'] as List<dynamic>?;
+      if (alts == null || alts.isEmpty) return;
+
+      final text = (alts[0]['transcript'] as String? ?? '').trim();
+      final isFinal = data['is_final'] as bool? ?? false;
+
+      if (text.isEmpty) return;
+
+      _ctrl.add(DeepgramTranscript(text: text, isFinal: isFinal));
     } catch (_) {}
   }
 
-  /// إيقاف البث والتسجيل
-  Future<void> stopStreaming() async {
-    await _audioRecorder.stop();
-    await _channel?.sink.close();
-    _channel = null;
+  void _onWsDone() {
+    _running = false;
   }
 
-  void dispose() {
-    stopStreaming();
-    _transcriptController.close();
+  Future<void> dispose() async {
+    await stop();
+    await _ctrl.close();
+    _recorder.dispose();
   }
+}
+
+class DeepgramTranscript {
+  const DeepgramTranscript({required this.text, required this.isFinal});
+  final String text;
+  final bool isFinal;
 }
