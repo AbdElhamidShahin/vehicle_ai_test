@@ -2,38 +2,36 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../constants/app_constants.dart';
 
-/// يبعت النص العربي لـ Gemini Flash Lite ويستخرج منه قايمة العربيات
+/// يبعت النص العربي لـ Gemini Flash ويستخرج منه قايمة العربيات
 class GeminiFlashService {
   static String get _endpoint =>
       'https://generativelanguage.googleapis.com/v1beta/models/'
-      '${AppConstants.geminiModel}:generateContent'
-      '?key=${AppConstants.geminiApiKey}';
+          '${AppConstants.geminiModel}:generateContent'
+          '?key=${AppConstants.geminiApiKey}';
 
-  static const _systemInstruction = '''
-أنت نظام استخراج بيانات مركبات من نص عربي مصري منطوق.
+  // ─── System Prompt للوحات السعودية ────────────────────────────────────────
+  static const _systemInstruction = r'''
+أنت نظام خبير في تحويل الكلمات الصوتية المنطوقة باللهجة المصرية (لأحرف وأرقام لوحات سيارات) إلى صيغتها النهائية الصحيحة.
 
-القواعد:
-1. استخرج كل سيارة ذُكرت في النص في عنصر منفصل.
-2. plate_number: رقم اللوحة كما نُطق (حروف + أرقام) — إلزامي.
-3. vehicle_type: نوع السيارة إن ذُكر، وإلا أرجع نصًا فارغًا.
-4. address: المكان إن ذُكر، وإلا أرجع نصًا فارغًا.
-5. لا تخترع أي معلومة غير موجودة في النص.
-6. لو النص لا يحتوي على أي لوحة، أرجع vehicles فارغة [].
-7. أرجع JSON فقط بدون أي شرح.
+═══ القاعدة الأساسية ═══
+العامل ينطق اللوحة بسرعة هكذا: "ميم نون سين واحد اتنين تلاتة أربعة" أو "أيه بي سي خمسة ستة".
+مهمتك هي تجميع هذه الحروف والأرقام المتفرقة وإخراجها بالشكل الصحيح:
+- الحروف المنطوقة (ميم نون سين أو م ن س) تصبح رمز الحروف.
+- الأرقام المنطوقة (واحد اتنين...) تصبح أرقاماً صريحة (1234).
 
-مثال:
-النص: "أ ب ج ١٢٣٤ تويوتا كامري... د هـ و ٥٦٧٨ نقل شارع الجيش"
-الإجابة:
-{
-  "vehicles": [
-    {"plate_number": "أ ب ج ١٢٣٤", "vehicle_type": "تويوتا كامري", "address": ""},
-    {"plate_number": "د هـ و ٥٦٧٨", "vehicle_type": "نقل", "address": "شارع الجيش"}
-  ]
-}
+═══ تصحيح الحروف المنطوقة بالحرف ═══
+- أحرف عربية: أ (ألف)، ب (باء)، ج (جيم)، د (دال)، ر (رأ)، س (سين)، ص (صاد)، ط (طاء)، ع (عين)، ف (فاء)، ق (قاف)، ك (كاف)، ل (لام)، م (ميم)، ن (نون)، هـ (هاء)، و (واو)، ي (ياء).
+- أحرف إنجليزية: إيه/أيه (A)، بي (B)، سي (C)، دي (D)، إف (F)، جي (G)، إتش (H)، كي (K)، إل (L)، إم (M)، إن (N)، آر (R)، إس (S)، تي (T)، إكس (X)، واي (Y)، زد (Z).
+
+═══ الأرقام ═══
+صفر=0, واحد=1, اتنين=2, تلاتة=3, أربعة=4, خمسة=5, ستة=6, سبعة=7, تمانية/ثمانية=8, تسعة=9.
+
+═══ المخرجات المطلوبة ═══
+أرجع JSON فقط بهذا الشكل بدقة شديدة:
+{"vehicles": [{"plate_number": "م ن س 1234", "vehicle_type": "", "address": ""}]}
+لو النص فارغ أو غير مف مفهوم، أرجع:
+{"vehicles": []}
 ''';
-
-  /// [transcript]      : النص من Groq
-  /// [previousContext] : آخر 2-3 جمل من chunks السابقة (اختياري، بيساعد على تجنب التكرار)
   Future<List<Map<String, dynamic>>> extractVehicles({
     required String transcript,
     String previousContext = '',
@@ -65,36 +63,75 @@ class GeminiFlashService {
       'generationConfig': {
         'responseMimeType': 'application/json',
         'temperature': 0,
-        'maxOutputTokens': 512,
+        'maxOutputTokens': 1024,
+        'topP': 1,
+        'topK': 1,
       },
     });
 
     final response = await http
         .post(
-          Uri.parse(_endpoint),
-          headers: {'Content-Type': 'application/json'},
-          body: body,
-        )
-        .timeout(const Duration(seconds: 15));
+      Uri.parse(_endpoint),
+      headers: {'Content-Type': 'application/json'},
+      body: body,
+    )
+        .timeout(const Duration(seconds: 20));
 
     if (response.statusCode != 200) {
-      throw Exception('Gemini Flash error ${response.statusCode}: ${response.body}');
+      throw Exception(
+          'Gemini Flash error ${response.statusCode}: ${response.body}');
     }
 
     final json = jsonDecode(response.body) as Map<String, dynamic>;
-    final text = (json['candidates']?[0]?['content']?['parts']?[0]?['text']
-            as String? ??
-        '').trim();
+    final text =
+    (json['candidates']?[0]?['content']?['parts']?[0]?['text'] as String? ??
+        '')
+        .trim();
 
     if (text.isEmpty) return [];
 
-    // تنظيف لو في ```json وعلامات زيادة
-    final clean = text
-        .replaceAll(RegExp(r'```json|```'), '')
-        .trim();
+    final clean = text.replaceAll(RegExp(r'```json|```'), '').trim();
 
-    final decoded = jsonDecode(clean) as Map<String, dynamic>;
-    final vehicles = decoded['vehicles'] as List<dynamic>? ?? [];
-    return vehicles.cast<Map<String, dynamic>>();
+    try {
+      final decoded = jsonDecode(clean) as Map<String, dynamic>;
+      final vehicles = decoded['vehicles'] as List<dynamic>? ?? [];
+
+      return vehicles
+          .cast<Map<String, dynamic>>()
+          .map((v) => {
+        ...v,
+        'plate_number':
+        _normalizePlate(v['plate_number'] as String? ?? ''),
+      })
+          .where((v) => (v['plate_number'] as String).isNotEmpty)
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// ─── تنظيف اللوحة ─────────────────────────────────────────────────────────
+  String _normalizePlate(String raw) {
+    var result = raw.trim();
+
+    // تحويل أرقام عربية/هندية لإنجليزية
+    const arabicDigits = '٠١٢٣٤٥٦٧٨٩';
+    for (var i = 0; i < arabicDigits.length; i++) {
+      result = result.replaceAll(arabicDigits[i], '$i');
+    }
+
+    // تأكد إن الحروف الإنجليزية كبيرة دايماً
+    // (Gemini أحياناً بيكتبها صغيرة)
+    final parts = result.split(' ');
+    if (parts.length >= 2) {
+      final letters = parts.first;
+      // لو الجزء الأول كله حروف لاتينية → حوّلهم uppercase
+      if (RegExp(r'^[a-zA-Z]+$').hasMatch(letters)) {
+        parts[0] = letters.toUpperCase();
+        result = parts.join(' ');
+      }
+    }
+
+    return result;
   }
 }

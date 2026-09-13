@@ -1,74 +1,73 @@
+import '../../../../core/ai/DeepgramLiveService.dart';
 import '../../data/models/vehicle_result.dart';
-import '../../../../core/ai/groq_stt_service.dart';
-import '../../../../core/ai/gemini_flash_service.dart';
-import '../../../../core/services/audio_service.dart';
 
 class VehicleRepository {
-  final AudioService audioService;
-  final GroqSttService groqService;
-  final GeminiFlashService geminiService;
-
-  /// آخر 3 transcripts عشان نديهم لـ Flash Lite كـ context
-  final _transcriptBuffer = <String>[];
+  final DeepgramLiveService deepgramService;
 
   VehicleRepository({
-    required this.audioService,
-    GroqSttService? groq,
-    GeminiFlashService? gemini,
-  })  : groqService = groq ?? GroqSttService(),
-        geminiService = gemini ?? GeminiFlashService();
+    DeepgramLiveService? deepgramLiveService,
+  }) : deepgramService = deepgramLiveService ?? DeepgramLiveService();
 
-  /// معالجة chunk صوتي واحد — بيرجع قايمة العربيات اللي اتذكرت فيه
-  Future<List<VehicleResult>> processChunk({
-    required String audioPath,
+  /// دالة التحقق والفلاتر الصارمة: تضمن أن اللوحة 3 حروف و 4 أرقام فقط
+  String _normalizeAndValidatePlate(String raw) {
+    var result = raw.trim();
+
+    // 1. تحويل الأرقام العربية لهندية/إنجليزية لو وجدت
+    const arabicDigits = '٠١٢٣٤٥٦٧٨٩';
+    for (var i = 0; i < arabicDigits.length; i++) {
+      result = result.replaceAll(arabicDigits[i], '$i');
+    }
+
+    // 2. فلتر وتنسيق الحروف والأرقام (مثال: 3 حروف أو أكثر بقليل متبوعة بمسافة و 4 أرقام)
+    final plateRegex = RegExp(r'^([أ-يA-Za-z\s]{2,8})\s+(\d{4})$');
+    result = result.replaceAll(RegExp(r'\s+'), ' ');
+
+    if (plateRegex.hasMatch(result)) {
+      final parts = result.split(' ');
+      if (parts.isNotEmpty && RegExp(r'^[a-zA-Z]+$').hasMatch(parts.first)) {
+        parts[0] = parts.first.toUpperCase();
+        result = parts.join(' ');
+      }
+      return result;
+    }
+
+    // لو غير مطابقة للشرط (ناقصة أو زايدة) → تُرفض فوراً
+    return '';
+  }
+
+  /// معالجة النص القادم من الـ Live Stream
+  List<VehicleResult> processLiveTranscript({
+    required String rawTranscript,
     required double? latitude,
     required double? longitude,
-  }) async {
-    // 1. قراءة الـ chunk
-    final bytes = await audioService.readBytes(audioPath);
-    await audioService.delete(audioPath);
+  }) {
+    final validatedPlate = _normalizeAndValidatePlate(rawTranscript);
 
-    // 2. Groq: صوت → نص
-    final transcript = await groqService.transcribe(bytes);
-    if (transcript.isEmpty) return [];
+    if (validatedPlate.isEmpty) return [];
 
-    // 3. Flash Lite: نص → قايمة عربيات
-    final context = _transcriptBuffer.length > 2
-        ? _transcriptBuffer.sublist(_transcriptBuffer.length - 2).join(' ')
-        : _transcriptBuffer.join(' ');
-
-    final extracted = await geminiService.extractVehicles(
-      transcript: transcript,
-      previousContext: context,
-    );
-
-    // تحديث الـ buffer
-    _transcriptBuffer.add(transcript);
-    if (_transcriptBuffer.length > 5) _transcriptBuffer.removeAt(0);
-
-    if (extracted.isEmpty) return [];
-
-    // 4. بناء نتائج
     final now = DateTime.now();
     final date =
         '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     final time =
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
-    return extracted
-        .map((v) => VehicleResult.fromExtracted(
-      v,
-      transcript: transcript,
+    final vehicleResult = VehicleResult.fromExtracted(
+      {
+        'plate_number': validatedPlate,
+        'vehicle_type': '',
+        'address': '',
+      },
+      transcript: rawTranscript,
       date: date,
       time: time,
       latitude: latitude,
       longitude: longitude,
-    ))
-        .where((r) => r.plateNumber.isNotEmpty)
-        .toList();
+    );
+
+    return [vehicleResult];
   }
 
-  void resetContext() => _transcriptBuffer.clear();
-
-  void dispose() {}
+  void dispose() {
+    deepgramService.dispose();
+  }
 }
