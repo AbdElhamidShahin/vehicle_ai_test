@@ -37,7 +37,7 @@ class HistorySection extends StatelessWidget {
           ),
           const Divider(),
           ...controller.history.map(
-            (v) => _VehicleItem(
+                (v) => _VehicleItem(
               item: v,
               controller: controller,
               onEdit: () => onEdit(v),

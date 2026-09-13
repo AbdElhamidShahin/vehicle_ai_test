@@ -1,24 +1,21 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
-import '../../../core/ai/cloud_function_ai_service.dart';
-import '../../../core/ai/firebase_ai_logic_vehicle_ai_service.dart';
-import '../../../core/ai/vehicle_ai_service.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/services/audio_service.dart';
 import '../../../core/services/location_service.dart';
 import '../../../core/services/internet_service.dart';
 import '../../../core/services/map_service.dart';
-import '../data/datasources/export_datasource.dart';
-import '../data/models/vehicle_result.dart';
-import '../data/repositories/vehicle_repository.dart';
+import '../../home/data/datasources/export_datasource.dart';
+import '../../home/data/models/vehicle_result.dart';
+import '../../home/data/repositories/vehicle_repository.dart';
 
 class HomeController extends ChangeNotifier {
-  late final AudioService _audio;
-  late final LocationService _location;
-  late final MapService _map;
-  late final InternetService _internet;
-  late final ExportDatasource _export;
-  late final VehicleRepository _repo;
+  final AudioService _audio;
+  final LocationService _location;
+  final MapService _map;
+  final InternetService _internet;
+  final ExportDatasource _export;
+  final VehicleRepository _repo;
 
   HomeController({
     AudioService? audio,
@@ -26,46 +23,43 @@ class HomeController extends ChangeNotifier {
     MapService? map,
     InternetService? internet,
     ExportDatasource? export,
-    VehicleAiService? ai,
-  }) {
-    _audio = audio ?? AudioService();
-    _location = location ?? LocationService();
-    _map = map ?? MapService();
-    _internet = internet ?? InternetService();
-    _export = export ?? ExportDatasource();
-    _repo = VehicleRepository(
-      audioService: _audio,
-      aiService: ai ?? _createAiService(),
-    );
-  }
+    VehicleRepository? repo,
+  })  : _audio = audio ?? AudioService(),
+        _location = location ?? LocationService(),
+        _map = map ?? MapService(),
+        _internet = internet ?? InternetService(),
+        _export = export ?? ExportDatasource(),
+        _repo = repo ?? VehicleRepository(audioService: audio ?? AudioService());
 
-  VehicleAiService _createAiService() {
-    // Temporary testing path: Firebase AI Logic -> Gemini 3.5 Flash-Lite.
-    // When AI_FUNCTION_URL is supplied, the production Cloud Function path wins.
-    if (AppConstants.aiFunctionUrl.isNotEmpty) {
-      return CloudFunctionAiService(
-        endpoint: Uri.parse(AppConstants.aiFunctionUrl),
-      );
-    }
-    return FirebaseAiLogicVehicleAiService();
-  }
-
+  // ── State ─────────────────────────────────────────────────────────────────
   final history = <VehicleResult>[];
-  Timer? _timer;
-  int seconds = 0;
   bool isRecording = false;
-  bool isProcessing = false;
+  bool isProcessing = false; // chunk يتعالج في الخلفية
   String status = 'جاهز للتسجيل';
-  String? _audioPath;
-  Future<LocationResult>? _locationFuture;
+  String liveTranscript = ''; // آخر نص ظهر من Groq
+  int seconds = 0;
+
+  // ── Internal ──────────────────────────────────────────────────────────────
+  Timer? _elapsedTimer;  // عداد الوقت
+  Timer? _chunkTimer;    // rotate chunk كل X ثواني
+  double? _latitude;
+  double? _longitude;
+  int _activeChunks = 0; // عدد الـ chunks اللي بتتعالج دلوقتي
 
   String get timeFormatted =>
-      '${(seconds ~/ 60).toString().padLeft(2, '0')}:${(seconds % 60).toString().padLeft(2, '0')}';
+      '${(seconds ~/ 60).toString().padLeft(2, '0')}:'
+          '${(seconds % 60).toString().padLeft(2, '0')}';
 
+  String get currentModel => AppConstants.activeGroqModel ==
+      AppConstants.groqModelTurbo
+      ? '⚡ Turbo'
+      : '🎯 Large v3';
+
+  // ── Recording ─────────────────────────────────────────────────────────────
   Future<void> startRecording() async {
     try {
       if (!await _internet.hasInternet()) {
-        status = '⚠️ لا يوجد اتصال بالإنترنت، اتصل بالإنترنت وحاول مرة أخرى';
+        status = '⚠️ لا يوجد اتصال بالإنترنت';
         notifyListeners();
         return;
       }
@@ -75,93 +69,122 @@ class HomeController extends ChangeNotifier {
         return;
       }
 
-      // Start location lookup at the same time as recording.
-      _locationFuture = _location.getCurrentLocation();
-      final path = await _audio.start();
+      // جيب الموقع في الخلفية مع بدء التسجيل
+      _fetchLocation();
 
-      _timer?.cancel();
+      await _audio.start();
+      _repo.resetContext();
+      liveTranscript = '';
       seconds = 0;
-      _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      isRecording = true;
+      status = '🎙️ جاري التسجيل... ($currentModel)';
+
+      // عداد الوقت كل ثانية
+      _elapsedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         seconds++;
         notifyListeners();
       });
 
-      isRecording = true;
-      isProcessing = false;
-      _audioPath = path;
-      status = '🎙️ جاري تسجيل بيانات السيارة...';
+      // chunk timer — rotate كل CHUNK_DURATION ثواني
+      _chunkTimer = Timer.periodic(
+        Duration(seconds: AppConstants.chunkDurationSeconds),
+            (_) => _rotateAndProcess(),
+      );
+
       notifyListeners();
     } catch (e) {
       status = _friendlyError(e);
-      _locationFuture = null;
       notifyListeners();
     }
   }
 
-  Future<void> stopAndProcessRecording() async {
-    try {
-      _timer?.cancel();
-      final path = await _audio.stop();
-      isRecording = false;
-      _audioPath = path ?? _audioPath;
-      notifyListeners();
-      if (_audioPath != null) await processRecording();
-    } catch (e) {
-      status = '❌ تعذر إيقاف التسجيل، حاول مرة أخرى';
-      notifyListeners();
-    }
-  }
+  Future<void> stopRecording() async {
+    _chunkTimer?.cancel();
+    _elapsedTimer?.cancel();
 
-  Future<void> processRecording() async {
-    final path = _audioPath;
-    if (path == null || !await _audio.exists(path)) {
-      status = '❌ لا يوجد ملف صوتي للمعالجة';
-      notifyListeners();
-      return;
-    }
-
-    isProcessing = true;
-    status = '🔄 جاري تحليل التسجيل...';
+    isRecording = false;
+    status = '⏳ جاري معالجة آخر جزء...';
     notifyListeners();
 
     try {
-      final result = await _repo.processRecording(
-        audioPath: path,
-        locationFuture: _locationFuture ?? _location.getCurrentLocation(),
+      // وقّف التسجيل وعالج آخر chunk
+      final lastPath = await _audio.stop();
+      if (lastPath != null) {
+        await _processChunk(lastPath);
+      }
+    } catch (e) {
+      // متوقف حتى لو فيه error في آخر chunk
+    }
+
+    status = history.isEmpty
+        ? '⚠️ لم يتم التعرف على أي لوحة'
+        : '✅ تم الانتهاء — ${history.length} سيارة';
+    notifyListeners();
+  }
+
+  // ── Chunk processing ──────────────────────────────────────────────────────
+
+  /// وقّف الـ chunk الحالي، ابدأ جديد، عالج القديم في الخلفية
+  Future<void> _rotateAndProcess() async {
+    if (!isRecording) return;
+    try {
+      final chunkPath = await _audio.rotateChunk();
+      if (chunkPath != null) {
+        // معالجة في الخلفية — مش بنستنى عشان التسجيل يكمل
+        _processChunk(chunkPath);
+      }
+    } catch (_) {
+      // مشكلة في الـ rotation → نكمل التسجيل بدون وقف
+    }
+  }
+
+  /// بعت الـ chunk لـ Groq ثم Flash Lite وأضف النتائج للجدول
+  Future<void> _processChunk(String chunkPath) async {
+    _activeChunks++;
+    isProcessing = true;
+    notifyListeners();
+
+    try {
+      final results = await _repo.processChunk(
+        audioPath: chunkPath,
+        latitude: _latitude,
+        longitude: _longitude,
       );
 
-      history.insert(0, result);
-      await _audio.delete(path);
-      _audioPath = null;
-      _locationFuture = null;
-
-      status = result.status == 'ok'
-          ? '✅ تم تسجيل السيارة بنجاح'
-          : '⚠️ لم يتم التعرف على رقم اللوحة، يرجى إعادة التسجيل';
-    } on TimeoutException {
-      status = '⚠️ انتهت مهلة الاتصال، حاول مرة أخرى';
-    } on LocationException catch (e) {
-      // Keep the audio when GPS failed so the record is not silently lost.
-      status = '📍 ${e.message}';
+      if (results.isNotEmpty) {
+        // أضف النتائج في أول الجدول
+        history.insertAll(0, results);
+        liveTranscript = results.first.transcript;
+        if (isRecording) {
+          status = '🎙️ جاري التسجيل... ($currentModel)  '
+              '| آخر لوحة: ${results.first.plateNumber}';
+        }
+      }
     } catch (e) {
-      status = _friendlyError(e);
+      // chunk فشل → نكمل بدون وقف
+      if (kDebugMode) print('Chunk error: $e');
     } finally {
-      isProcessing = false;
+      _activeChunks--;
+      if (_activeChunks <= 0) {
+        _activeChunks = 0;
+        isProcessing = false;
+      }
       notifyListeners();
     }
   }
 
-  String _friendlyError(Object error) {
-    final text = error.toString().toLowerCase();
-    if (text.contains('internet') || text.contains('socket')) {
-      return '⚠️ لا يوجد اتصال بالإنترنت، اتصل بالإنترنت وحاول مرة أخرى';
+  // ── Location ──────────────────────────────────────────────────────────────
+  Future<void> _fetchLocation() async {
+    try {
+      final result = await _location.getCurrentLocation();
+      _latitude = result.latitude;
+      _longitude = result.longitude;
+    } catch (_) {
+      // الموقع اختياري — التطبيق يكمل بدونه
     }
-    if (text.contains('backend') || text.contains('ai')) {
-      return '⚠️ تعذر تحليل التسجيل، حاول مرة أخرى';
-    }
-    return '❌ حدث خطأ، حاول مرة أخرى';
   }
 
+  // ── Edit / Delete ─────────────────────────────────────────────────────────
   void deleteItem(String id) {
     history.removeWhere((e) => e.id == id);
     status = 'تم حذف السطر';
@@ -169,20 +192,22 @@ class HomeController extends ChangeNotifier {
   }
 
   void updateItem(
-    VehicleResult item, {
-    required String plateNumber,
-    required String vehicleType,
-    required String address,
-  }) {
+      VehicleResult item, {
+        required String plateNumber,
+        required String vehicleType,
+        required String address,
+      }) {
     item.plateNumber = plateNumber.trim();
     item.vehicleType = vehicleType.trim();
     item.address = address.trim();
     item.status = item.plateNumber.isEmpty ? 'needs_review' : 'ok';
-    item.error = item.plateNumber.isEmpty ? 'لم يتم التعرف على رقم اللوحة' : null;
+    item.error =
+    item.plateNumber.isEmpty ? 'لم يتم التعرف على رقم اللوحة' : null;
     status = 'تم التعديل بنجاح';
     notifyListeners();
   }
 
+  // ── Export / Map ──────────────────────────────────────────────────────────
   Future<bool> openMap(String url) => _map.open(url);
 
   Future<void> exportToExcel() async {
@@ -195,14 +220,27 @@ class HomeController extends ChangeNotifier {
       await _export.exportVehicles(history);
       status = 'تم التصدير بنجاح';
     } catch (_) {
-      status = '❌ فشل التصدير، حاول مرة أخرى';
+      status = '❌ فشل التصدير';
     }
     notifyListeners();
   }
 
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  String _friendlyError(Object error) {
+    final text = error.toString().toLowerCase();
+    if (text.contains('internet') || text.contains('socket')) {
+      return '⚠️ لا يوجد اتصال بالإنترنت';
+    }
+    if (text.contains('groq') || text.contains('gemini')) {
+      return '⚠️ تعذر الاتصال بالـ AI، حاول مرة أخرى';
+    }
+    return '❌ حدث خطأ، حاول مرة أخرى';
+  }
+
   @override
   void dispose() {
-    _timer?.cancel();
+    _chunkTimer?.cancel();
+    _elapsedTimer?.cancel();
     _audio.dispose();
     _repo.dispose();
     super.dispose();

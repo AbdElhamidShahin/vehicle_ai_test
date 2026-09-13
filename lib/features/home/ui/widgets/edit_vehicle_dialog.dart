@@ -3,10 +3,10 @@ import '../../data/models/vehicle_result.dart';
 import '../../logic/home_controller.dart';
 
 Future<void> showEditVehicleDialog(
-  BuildContext context, {
-  required HomeController controller,
-  required VehicleResult item,
-}) async {
+    BuildContext context, {
+      required HomeController controller,
+      required VehicleResult item,
+    }) async {
   final plate = TextEditingController(text: item.plateNumber),
       type = TextEditingController(text: item.vehicleType),
       address = TextEditingController(text: item.address);
