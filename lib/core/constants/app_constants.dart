@@ -15,7 +15,7 @@ class AppConstants {
   // مفتاح Deepgram للـ Streaming (يمكنك استبداله بمفتاحك الخاص)
   static const deepgramApiKey = String.fromEnvironment(
     'DEEPGRAM_API_KEY',
-    defaultValue: 'YOUR_DEEPGRAM_API_KEY_HERE',
+    defaultValue: 'f05fce2e609dbf5725d772491cd24ffa97a2a3f2',
   );
 
   static const audioMimeType = 'audio/mp4';

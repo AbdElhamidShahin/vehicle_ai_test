@@ -1,15 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:record/record.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 class DeepgramLiveService {
   DeepgramLiveService({required this.apiKey});
 
   final String apiKey;
 
-  WebSocket? _ws;
+  WebSocketChannel? _channel;
   StreamSubscription? _wsSub;
 
   final _recorder = AudioRecorder();
@@ -21,14 +22,17 @@ class DeepgramLiveService {
   bool _running = false;
   bool get isRunning => _running;
 
+  Timer? _keepAliveTimer;
+
   Future<void> start() async {
     if (_running) return;
-    if (apiKey.isEmpty) throw StateError('Deepgram API key is empty');
-
+    if (apiKey.isEmpty) throw StateError('Deepgram API key فارغ');
     if (!await _recorder.hasPermission()) {
-      throw StateError('Microphone permission denied');
+      throw StateError('صلاحية الميكروفون مرفوضة');
     }
 
+    // ✅ web_socket_channel بيتعامل مع wss:// صح على Android
+    // بنبني الـ URI بـ Uri.parse على string ثابتة — مش Uri() constructor
     final uri = Uri.parse(
       'wss://api.deepgram.com/v1/listen'
           '?model=nova-2'
@@ -42,16 +46,16 @@ class DeepgramLiveService {
     );
 
     try {
-      // 💡 الحل المعتمد في المنصات التي ترفض الـ Headers المخصصة:
-      // تمرير المفتاح عبر الـ protocols (Sec-WebSocket-Protocol)
-      _ws = await WebSocket.connect(
-        uri.toString(),
+      _channel = WebSocketChannel.connect(
+        uri,
         protocols: ['token', apiKey],
       );
 
-      _wsSub = _ws!.listen(
+      await _channel!.ready;
+
+      _wsSub = _channel!.stream.listen(
         _onWsMessage,
-        onError: (e) => _ctrl.addError(e),
+        onError: (e) { if (!_ctrl.isClosed) _ctrl.addError(e); },
         onDone: _onWsDone,
         cancelOnError: false,
       );
@@ -70,13 +74,14 @@ class DeepgramLiveService {
 
     _audioSub = audioStream.listen(
           (Uint8List chunk) {
-        if (_ws != null && _ws!.readyState == WebSocket.open) {
-          _ws!.add(chunk);
-        }
+        try { _channel?.sink.add(chunk); } catch (_) {}
       },
-      onError: (e) => _ctrl.addError(e),
       cancelOnError: false,
     );
+
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      try { _channel?.sink.add(jsonEncode({'type': 'KeepAlive'})); } catch (_) {}
+    });
 
     _running = true;
   }
@@ -85,25 +90,22 @@ class DeepgramLiveService {
     if (!_running) return;
     _running = false;
 
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = null;
+
     await _audioSub?.cancel();
     _audioSub = null;
-    try {
-      await _recorder.stop();
-    } catch (_) {}
+    try { await _recorder.stop(); } catch (_) {}
 
     try {
-      if (_ws != null && _ws!.readyState == WebSocket.open) {
-        _ws!.add(jsonEncode({'type': 'CloseStream'}));
-        await Future<void>.delayed(const Duration(milliseconds: 400));
-      }
+      _channel?.sink.add(jsonEncode({'type': 'CloseStream'}));
+      await Future<void>.delayed(const Duration(milliseconds: 400));
     } catch (_) {}
 
     await _wsSub?.cancel();
     _wsSub = null;
-    try {
-      await _ws?.close();
-    } catch (_) {}
-    _ws = null;
+    try { await _channel?.sink.close(); } catch (_) {}
+    _channel = null;
   }
 
   void _onWsMessage(dynamic raw) {
@@ -111,6 +113,8 @@ class DeepgramLiveService {
     try {
       final data = jsonDecode(raw) as Map<String, dynamic>;
       if (data['type'] == 'Metadata') return;
+      if (data['type'] == 'SpeechStarted') return;
+      if (data['type'] == 'UtteranceEnd') return;
 
       final channel = data['channel'] as Map<String, dynamic>?;
       final alts = channel?['alternatives'] as List<dynamic>?;
@@ -118,26 +122,35 @@ class DeepgramLiveService {
 
       final text = (alts[0]['transcript'] as String? ?? '').trim();
       final isFinal = data['is_final'] as bool? ?? false;
+      final speechFinal = data['speech_final'] as bool? ?? false;
 
       if (text.isEmpty) return;
-
-      _ctrl.add(DeepgramTranscript(text: text, isFinal: isFinal));
+      if (!_ctrl.isClosed) {
+        _ctrl.add(DeepgramTranscript(
+          text: text,
+          isFinal: isFinal,
+          speechFinal: speechFinal,
+        ));
+      }
     } catch (_) {}
   }
 
-  void _onWsDone() {
-    _running = false;
-  }
+  void _onWsDone() { _running = false; }
 
   Future<void> dispose() async {
     await stop();
-    await _ctrl.close();
+    if (!_ctrl.isClosed) await _ctrl.close();
     _recorder.dispose();
   }
 }
 
 class DeepgramTranscript {
-  const DeepgramTranscript({required this.text, required this.isFinal});
+  const DeepgramTranscript({
+    required this.text,
+    required this.isFinal,
+    this.speechFinal = false,
+  });
   final String text;
   final bool isFinal;
+  final bool speechFinal;
 }
