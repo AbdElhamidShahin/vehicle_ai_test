@@ -1,9 +1,8 @@
-# pubspec.yaml — المُحدَّث
 name: vehicle_ai_test
-description: "تسجيل لوحات السيارات — Deepgram Nova-2 Real-time"
+description: "Vehicle voice data collection - Groq Whisper Turbo + Gemini Flash Lite 2.5"
 publish_to: 'none'
 
-version: 1.0.0+4
+version: 1.0.0+3
 
 environment:
   sdk: ^3.8.1
@@ -13,19 +12,15 @@ dependencies:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
-
-  # ✅ الميكروفون كـ PCM Stream مباشر
   record: ^6.1.2
-
-  # ✅ WebSocket يشتغل على Android + iOS + Web
-  web_socket_channel: ^3.0.3
-
-  # باقي الـ dependencies
   http: ^1.5.0
   path_provider: ^2.1.5
   share_plus: ^12.0.2
   geolocator: ^14.0.2
   url_launcher: ^6.3.2
+  web_socket_channel: ^3.0.3
+
+  # Firebase removed — replaced by direct Groq + Gemini REST APIs
 
 dev_dependencies:
   flutter_test:

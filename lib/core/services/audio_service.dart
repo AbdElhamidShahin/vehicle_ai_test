@@ -5,19 +5,19 @@ import 'package:record/record.dart';
 class AudioService {
   final AudioRecorder _recorder = AudioRecorder();
 
-  Future<bool> hasPermission() => _recorder.hasPermission();
+  // 16kHz mono — أنسب سعر sampling لـ Whisper
+  final _config = const RecordConfig(
+    encoder: AudioEncoder.aacLc,
+    sampleRate: 16000,
+    numChannels: 1,
+    bitRate: 64000,
+  );
 
-  RecordConfig get _config => const RecordConfig(
-        encoder: AudioEncoder.aacLc,
-        sampleRate: 16000,
-        numChannels: 1,
-        bitRate: 64000,
-      );
+  Future<bool> hasPermission() => _recorder.hasPermission();
 
   String _newPath(Directory dir) =>
       '${dir.path}/chunk_${DateTime.now().millisecondsSinceEpoch}.m4a';
 
-  /// بدء التسجيل — بيرجع المسار
   Future<String> start() async {
     final dir = await getTemporaryDirectory();
     final path = _newPath(dir);
@@ -25,27 +25,23 @@ class AudioService {
     return path;
   }
 
-  /// [للـ Live mode] وقّف chunk الحالي وابدأ chunk جديد فوراً.
-  /// بيرجع مسار الـ chunk اللي اتوقف عشان نبعته لـ Groq.
+  /// وقّف الـ chunk الحالي وابدأ واحد جديد فوراً
   Future<String?> rotateChunk() async {
-    final finishedPath = await _recorder.stop();
-    // ابدأ chunk جديد فوراً بدون انتظار
+    final finished = await _recorder.stop();
     final dir = await getTemporaryDirectory();
-    final newPath = _newPath(dir);
-    await _recorder.start(_config, path: newPath);
-    return finishedPath;
+    await _recorder.start(_config, path: _newPath(dir));
+    return finished;
   }
 
-  /// وقّف التسجيل نهائياً — بيرجع مسار آخر chunk
   Future<String?> stop() => _recorder.stop();
 
   Future<List<int>> readBytes(String path) => File(path).readAsBytes();
 
-  Future<bool> exists(String path) => File(path).exists();
-
   Future<void> delete(String path) async {
-    final f = File(path);
-    if (await f.exists()) await f.delete();
+    try {
+      final f = File(path);
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
   }
 
   Future<void> dispose() => _recorder.dispose();

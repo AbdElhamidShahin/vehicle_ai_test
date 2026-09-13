@@ -7,8 +7,8 @@ class RecorderCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final recording = controller.isRecording;
-    final processing = controller.isProcessing;
+    final rec  = controller.isRecording;
+    final proc = controller.isProcessing;
 
     return Card(
       elevation: 0,
@@ -16,55 +16,44 @@ class RecorderCard extends StatelessWidget {
         padding: const EdgeInsets.all(20),
         child: Column(
           children: [
-            // ── أيقونة التسجيل ──────────────────────────────────────────
-            Stack(
-              alignment: Alignment.bottomRight,
-              children: [
-                CircleAvatar(
-                  radius: 48,
-                  backgroundColor:
-                  recording ? Colors.red.shade100 : Colors.indigo.shade50,
-                  child: Icon(
-                    recording ? Icons.mic : Icons.mic_none,
-                    size: 48,
-                    color: recording ? Colors.red : Colors.indigo,
+            // ── أيقونة ─────────────────────────────────────────────────────
+            Stack(alignment: Alignment.bottomRight, children: [
+              CircleAvatar(
+                radius: 48,
+                backgroundColor:
+                rec ? Colors.red.shade100 : Colors.indigo.shade50,
+                child: Icon(
+                  rec ? Icons.mic : Icons.mic_none,
+                  size: 48,
+                  color: rec ? Colors.red : Colors.indigo,
+                ),
+              ),
+              if (proc && rec)
+                Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: const BoxDecoration(
+                      color: Colors.orange, shape: BoxShape.circle),
+                  child: const SizedBox(
+                    width: 14, height: 14,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white),
                   ),
                 ),
-                // مؤشر صغير لما بيتعالج chunk في الخلفية
-                if (processing && recording)
-                  Positioned(
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: const BoxDecoration(
-                        color: Colors.orange,
-                        shape: BoxShape.circle,
-                      ),
-                      child: const SizedBox(
-                        width: 12,
-                        height: 12,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
+            ]),
 
             const SizedBox(height: 14),
 
-            // ── الوقت أو الحالة ─────────────────────────────────────────
+            // ── الوقت / الحالة ──────────────────────────────────────────────
             Text(
-              recording ? controller.timeFormatted : controller.status,
-              style:
-              const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              rec ? controller.timeFormatted : controller.status,
+              style: const TextStyle(
+                  fontSize: 16, fontWeight: FontWeight.w700),
               textAlign: TextAlign.center,
             ),
 
-            // ── آخر نص ظهر من Groq ─────────────────────────────────────
-            if (recording && controller.liveTranscript.isNotEmpty) ...[
-              const SizedBox(height: 8),
+            // ── آخر نص من Groq ──────────────────────────────────────────────
+            if (rec && controller.liveTranscript.isNotEmpty) ...[
+              const SizedBox(height: 10),
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(10),
@@ -76,7 +65,7 @@ class RecorderCard extends StatelessWidget {
                 child: Text(
                   '📝 ${controller.liveTranscript}',
                   style: TextStyle(
-                      fontSize: 13, color: Colors.green.shade800),
+                      fontSize: 12, color: Colors.green.shade800),
                   textDirection: TextDirection.rtl,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
@@ -84,54 +73,58 @@ class RecorderCard extends StatelessWidget {
               ),
             ],
 
-            // ── عدد العربيات أثناء التسجيل ─────────────────────────────
-            if (recording && controller.history.isNotEmpty) ...[
-              const SizedBox(height: 6),
-              Text(
-                '🚗 ${controller.history.length} سيارة تم تسجيلها',
-                style: TextStyle(
-                    fontSize: 13,
-                    color: Colors.indigo.shade700,
-                    fontWeight: FontWeight.w600),
-              ),
+            // ── عداد اللوحات ────────────────────────────────────────────────
+            if (rec && controller.history.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Text(
+                  '🚗 ${controller.history.length} سيارة',
+                  style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.indigo.shade700,
+                      fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(width: 12),
+                // عدد اللي محتاجة مراجعة
+                if (controller.history
+                    .any((r) => r.status == 'needs_review'))
+                  Text(
+                    '⚠️ ${controller.history.where((r) => r.status == 'needs_review').length} تحتاج مراجعة',
+                    style: TextStyle(
+                        fontSize: 12, color: Colors.orange.shade700),
+                  ),
+              ]),
             ],
 
             const SizedBox(height: 20),
 
-            // ── زر التسجيل ─────────────────────────────────────────────
+            // ── زر التسجيل ──────────────────────────────────────────────────
             SizedBox(
               width: double.infinity,
               height: 56,
               child: FilledButton.icon(
-                onPressed: recording
-                    ? controller.stopRecording
-                    : controller.startRecording,
-                icon: Icon(recording ? Icons.stop_circle : Icons.mic),
+                onPressed:
+                rec ? controller.stopRecording : controller.startRecording,
+                icon: Icon(rec ? Icons.stop_circle : Icons.mic),
                 style: FilledButton.styleFrom(
-                  backgroundColor:
-                  recording ? Colors.red.shade700 : null,
+                  backgroundColor: rec ? Colors.red.shade700 : null,
                 ),
                 label: Text(
-                  recording ? 'إنهاء التسجيل' : 'ابدأ التسجيل الصوتي',
+                  rec ? 'إنهاء التسجيل' : 'ابدأ التسجيل الصوتي',
                   style: const TextStyle(fontSize: 16),
                 ),
               ),
             ),
 
-            // ── مؤشر المعالجة في الخلفية ────────────────────────────────
-            if (processing && !recording) ...[
+            if (proc && !rec) ...[
               const SizedBox(height: 16),
-              const Row(
-                children: [
-                  SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  SizedBox(width: 8),
-                  Text('جاري معالجة آخر جزء...'),
-                ],
-              ),
+              const Row(children: [
+                SizedBox(
+                    width: 16, height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 8),
+                Text('جاري معالجة آخر جزء...'),
+              ]),
             ],
           ],
         ),

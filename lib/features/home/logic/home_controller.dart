@@ -1,145 +1,173 @@
-// lib/features/home/logic/home_controller.dart
-//
-// ✅ الإصلاحات:
-//   1. استدعاء _repo.initialize() بعد _deepgram.start() مباشرةً
-//   2. الـ _interimSub بيستمع للـ interim فقط (مش isFinal) للعرض في الـ UI
-//   3. الـ _plateSub بيستمع لـ _repo.plateStream (StreamController حقيقي)
-//   4. liveText بيتمسح لما تيجي لوحة مكتملة
-//   5. الـ API key بييجي من AppConstants بدل hardcoded string فارغ
-
 import 'dart:async';
 import 'package:flutter/foundation.dart';
-
-import '../../../core/ai/DeepgramLiveService.dart';
 import '../../../core/constants/app_constants.dart';
-import '../data/models/vehicle_result.dart';
-import '../data/repositories/vehicle_repository.dart';
+import '../../../core/services/audio_service.dart';
+import '../../../core/services/location_service.dart';
+import '../../../core/services/internet_service.dart';
+import '../../../core/services/map_service.dart';
+import '../../home/data/datasources/export_datasource.dart';
+import '../../home/data/models/vehicle_result.dart';
+import '../../home/data/repositories/vehicle_repository.dart';
 
 class HomeController extends ChangeNotifier {
+  final AudioService      _audio;
+  final LocationService   _location;
+  final MapService        _map;
+  final InternetService   _internet;
+  final ExportDatasource  _export;
+  final VehicleRepository _repo;
 
-  // ── Services ───────────────────────────────────────────────────────────────
-  late final DeepgramLiveService _deepgram;
-  late final VehicleRepository   _repo;
-
-  StreamSubscription<VehicleResult>?      _plateSub;
-  StreamSubscription<DeepgramTranscript>? _interimSub;
-
-  HomeController() {
-    // ✅ الـ API key من AppConstants (مش hardcoded)
-    _deepgram = DeepgramLiveService(apiKey: AppConstants.deepgramApiKey);
-    _repo     = VehicleRepository(deepgram: _deepgram);
-  }
+  HomeController({
+    AudioService?      audio,
+    LocationService?   location,
+    MapService?        map,
+    InternetService?   internet,
+    ExportDatasource?  export,
+    VehicleRepository? repo,
+  })  : _audio    = audio    ?? AudioService(),
+        _location = location ?? LocationService(),
+        _map      = map      ?? MapService(),
+        _internet = internet ?? InternetService(),
+        _export   = export   ?? ExportDatasource(),
+        _repo     = repo     ?? VehicleRepository(
+            audioService: audio ?? AudioService());
 
   // ── State ──────────────────────────────────────────────────────────────────
-  final history = <VehicleResult>[];
-  bool   isRecording  = false;
-  bool   isProcessing = false; // للتوافق مع RecorderCard الموجود
+  final history   = <VehicleResult>[];
+  bool isRecording  = false;
+  bool isProcessing = false;
   String status       = 'جاهز للتسجيل';
-  String liveText     = '';   // النص الـ interim يظهر وأنت بتتكلم
-  String liveTranscript = ''; // للتوافق مع RecorderCard القديم
-  int    seconds      = 0;
+  String liveTranscript = '';
+  int seconds = 0;
 
-  Timer? _clock;
+  // ── Internal ───────────────────────────────────────────────────────────────
+  Timer? _elapsedTimer;
+  Timer? _chunkTimer;
+  double? _latitude;
+  double? _longitude;
+  int _activeChunks = 0;
 
   String get timeFormatted =>
       '${(seconds ~/ 60).toString().padLeft(2, '0')}:'
           '${(seconds % 60).toString().padLeft(2, '0')}';
 
-  // ── GPS ───────────────────────────────────────────────────────────────────
-  void setLocation(double lat, double lng) {
-    _repo.latitude  = lat;
-    _repo.longitude = lng;
-  }
+  String get activeModel =>
+      AppConstants.activeGroqModel == AppConstants.groqModelTurbo
+          ? '⚡ Turbo'
+          : '🎯 Large v3';
 
-  // ── Start ──────────────────────────────────────────────────────────────────
+  // ── Recording ──────────────────────────────────────────────────────────────
   Future<void> startRecording() async {
-    if (isRecording) return;
-
-    liveText      = '';
-    liveTranscript = '';
-    seconds       = 0;
-    _repo.resetBuffer();
-    notifyListeners();
-
     try {
-      // 1. فتح الـ WebSocket + بدء الميكروفون
-      await _deepgram.start();
+      if (!await _internet.hasInternet()) {
+        _setStatus('⚠️ لا يوجد اتصال بالإنترنت');
+        return;
+      }
+      if (!await _audio.hasPermission()) {
+        _setStatus('🎙️ يجب السماح للتطبيق باستخدام الميكروفون');
+        return;
+      }
 
-      // ✅ 2. بعد ما الـ service اشتغل، نربط الـ repository بالـ stream
-      _repo.initialize();
+      _fetchLocation();
+      await _audio.start();
+      _repo.resetSession();
 
-      // 3. اشترك في النص الـ interim (للعرض الفوري في الـ UI)
-      _interimSub = _deepgram.onTranscript.listen((t) {
-        if (!t.isFinal) {
-          // ✅ بس الـ interim يظهر — الـ final بيتعالج في الـ repository
-          liveText      = t.text;
-          liveTranscript = t.text; // للتوافق مع RecorderCard
-          notifyListeners();
-        } else {
-          // لما تيجي نتيجة final، امسح الـ live text (اللوحة هتظهر في الـ history)
-          liveText      = '';
-          liveTranscript = '';
-          notifyListeners();
-        }
-      });
+      liveTranscript = '';
+      seconds       = 0;
+      isRecording   = true;
+      _setStatus('🎙️ جاري التسجيل... ($activeModel)');
 
-      // 4. اشترك في اللوحات المكتملة
-      _plateSub = _repo.plateStream.listen((result) {
-        history.insert(0, result);
-        liveText      = '';
-        liveTranscript = '';
-        status = '✅ لوحة ${result.plateNumber} — ${history.length} إجمالاً';
-        notifyListeners();
-      });
+      _elapsedTimer = Timer.periodic(
+        const Duration(seconds: 1),
+            (_) { seconds++; notifyListeners(); },
+      );
 
-      // 5. عداد الوقت
-      _clock = Timer.periodic(const Duration(seconds: 1), (_) {
-        seconds++;
-        notifyListeners();
-      });
-
-      isRecording = true;
-      status      = '🎙️ جاري التسجيل...';
-      notifyListeners();
-
+      _chunkTimer = Timer.periodic(
+        Duration(seconds: AppConstants.chunkDurationSeconds),
+            (_) => _rotateAndProcess(),
+      );
     } catch (e) {
-      status = '❌ خطأ: $e';
-      isRecording = false;
-      notifyListeners();
-      rethrow;
+      _setStatus(_friendlyError(e));
     }
   }
 
-  // ── Stop ───────────────────────────────────────────────────────────────────
   Future<void> stopRecording() async {
+    _chunkTimer?.cancel();
+    _elapsedTimer?.cancel();
+    isRecording = false;
+    _setStatus('⏳ جاري معالجة آخر جزء...');
+
+    try {
+      final lastPath = await _audio.stop();
+      if (lastPath != null) await _processChunk(lastPath);
+    } catch (_) {}
+
+    _setStatus(history.isEmpty
+        ? '⚠️ لم يتم التعرف على أي لوحة'
+        : '✅ تم — ${history.length} سيارة مسجلة');
+  }
+
+  // ── Chunk logic ────────────────────────────────────────────────────────────
+  Future<void> _rotateAndProcess() async {
     if (!isRecording) return;
+    try {
+      final path = await _audio.rotateChunk();
+      if (path != null) _processChunk(path); // بدون await — التسجيل يكمل
+    } catch (e) {
+      if (kDebugMode) print('Rotate error: $e');
+    }
+  }
 
-    _clock?.cancel();
-    _clock = null;
-
-    await _interimSub?.cancel();
-    _interimSub = null;
-
-    await _plateSub?.cancel();
-    _plateSub = null;
-
-    await _deepgram.stop();
-
-    isRecording   = false;
-    isProcessing  = false;
-    liveText      = '';
-    liveTranscript = '';
-    status = history.isEmpty
-        ? '⚠️ لم يُتعرف على أي لوحة'
-        : '✅ انتهى — ${history.length} لوحة';
+  Future<void> _processChunk(String chunkPath) async {
+    _activeChunks++;
+    isProcessing = true;
     notifyListeners();
+
+    try {
+      final results = await _repo.processChunk(
+        audioPath: chunkPath,
+        latitude:  _latitude,
+        longitude: _longitude,
+      );
+
+      // حدّث آخر نص من Groq
+      if (_repo.lastTranscript.isNotEmpty) {
+        liveTranscript = _repo.lastTranscript;
+      }
+
+      if (results.isNotEmpty) {
+        history.insertAll(0, results);
+        if (isRecording) {
+          _setStatus(
+            '🎙️ ($activeModel) | آخر لوحة: ${results.first.plateNumber}',
+          );
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) print('Chunk error: $e');
+      if (isRecording) {
+        _setStatus('⚠️ خطأ في معالجة الصوت: ${_friendlyError(e)}');
+      }
+    } finally {
+      _activeChunks = (_activeChunks - 1).clamp(0, 99);
+      isProcessing  = _activeChunks > 0;
+      notifyListeners();
+    }
+  }
+
+  // ── Location ───────────────────────────────────────────────────────────────
+  Future<void> _fetchLocation() async {
+    try {
+      final r = await _location.getCurrentLocation();
+      _latitude  = r.latitude;
+      _longitude = r.longitude;
+    } catch (_) {}
   }
 
   // ── Edit / Delete ──────────────────────────────────────────────────────────
   void deleteItem(String id) {
     history.removeWhere((e) => e.id == id);
-    status = 'تم الحذف';
-    notifyListeners();
+    _setStatus('تم حذف السطر');
   }
 
   void updateItem(
@@ -152,26 +180,42 @@ class HomeController extends ChangeNotifier {
     item.vehicleType = vehicleType.trim();
     item.address     = address.trim();
     item.status      = item.plateNumber.isEmpty ? 'needs_review' : 'ok';
-    status = 'تم التعديل';
-    notifyListeners();
+    item.confidence  = 'high'; // بعد التعديل اليدوي = موثوق
+    _setStatus('✅ تم التعديل');
   }
 
-  // ── Export (للتوافق مع HistorySection) ────────────────────────────────────
+  // ── Export / Map ───────────────────────────────────────────────────────────
+  Future<bool> openMap(String url) => _map.open(url);
+
   Future<void> exportToExcel() async {
-    // TODO: اربطه بـ export_datasource.dart
+    if (history.isEmpty) { _setStatus('لا توجد بيانات'); return; }
+    try {
+      await _export.exportVehicles(history);
+      _setStatus('✅ تم التصدير');
+    } catch (_) {
+      _setStatus('❌ فشل التصدير');
+    }
   }
 
-  Future<bool> openMap(String url) async {
-    // TODO: استخدم url_launcher
-    return false;
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  void _setStatus(String s) { status = s; notifyListeners(); }
+
+  String _friendlyError(Object e) {
+    final t = e.toString().toLowerCase();
+    if (t.contains('socket') || t.contains('network')) {
+      return '⚠️ لا يوجد اتصال بالإنترنت';
+    }
+    if (t.contains('groq')) return '⚠️ خطأ في Groq';
+    if (t.contains('gemini')) return '⚠️ خطأ في Gemini';
+    if (t.contains('timeout')) return '⚠️ انتهت مهلة الاتصال';
+    return '❌ حدث خطأ';
   }
 
   @override
   void dispose() {
-    _clock?.cancel();
-    _interimSub?.cancel();
-    _plateSub?.cancel();
-    _deepgram.dispose();
+    _chunkTimer?.cancel();
+    _elapsedTimer?.cancel();
+    _audio.dispose();
     _repo.dispose();
     super.dispose();
   }
