@@ -1,70 +1,183 @@
-import '../models/vehicle_result.dart';
+// lib/features/home/data/repositories/vehicle_repository.dart
+//
+// ✅ الإصلاحات:
+//   1. Queue بدل skip — مفيش chunk بيتضيع
+//   2. كل final transcript بيتبعت لـ Gemini مستقل (مش بس speechFinal)
+//      — لإن speechFinal ممكن تيجي مرة واحدة لكل اللوحات مع بعض
+//   3. الـ buffer بيتمسح بعد كل final للتقليل من التراكم
+
+import 'dart:async';
+import '../../../../core/ai/DeepgramLiveService.dart';
 import '../../../../core/ai/gemini_flash_service.dart';
+import '../models/vehicle_result.dart';
 
-/// بيأخد النص من whisper.cpp ويبعته لـ Flash Lite ويرجع اللوحات
 class VehicleRepository {
-  final GeminiFlashService _gemini;
+  VehicleRepository({required this.deepgram});
 
-  final _transcriptBuffer = <String>[];
-  final _seenPlates       = <String>{};
-  String lastTranscript   = '';
+  final DeepgramLiveService deepgram;
+  final _gemini = GeminiFlashService();
 
-  VehicleRepository({GeminiFlashService? gemini})
-      : _gemini = gemini ?? GeminiFlashService();
+  final _plateCtrl = StreamController<VehicleResult>.broadcast();
+  Stream<VehicleResult> get plateStream => _plateCtrl.stream;
 
-  /// بياخد نص من whisper ويرجع اللوحات المستخرجة
-  Future<List<VehicleResult>> processTranscript({
-    required String transcript,
-    required double? latitude,
-    required double? longitude,
-  }) async {
-    lastTranscript = transcript;
-    if (transcript.trim().isEmpty) return [];
+  StreamSubscription<DeepgramTranscript>? _transcriptSub;
 
-    final context = _transcriptBuffer.length >= 2
-        ? _transcriptBuffer.sublist(_transcriptBuffer.length - 2).join(' ')
-        : _transcriptBuffer.join(' ');
+  // ✅ Queue بدل _isFlushing flag
+  final _queue = <String>[];
+  bool _isProcessing = false;
 
-    final extracted = await _gemini.extractVehicles(
-      transcript: transcript,
-      previousContext: context,
-    );
+  // Buffer للـ interim finals قبل speechFinal
+  final StringBuffer _buf = StringBuffer();
 
-    _transcriptBuffer.add(transcript);
-    if (_transcriptBuffer.length > 5) _transcriptBuffer.removeAt(0);
+  // عدد finals المتراكمة (لو وصلت حد معين نبعت حتى لو مفيش speechFinal)
+  int _finalCount = 0;
+  static const int _maxFinalsBeforeFlush = 3; // ابعت كل 3 finals
 
-    if (extracted.isEmpty) return [];
+  double? latitude;
+  double? longitude;
 
-    final now  = DateTime.now();
-    final date = _fmt(now, date: true);
-    final time = _fmt(now, date: false);
+  // ── initialize ────────────────────────────────────────────────────────────
+  void initialize() {
+    _transcriptSub?.cancel();
+    print('🟢 [REPO] initialize()');
 
-    final results = <VehicleResult>[];
-    for (final v in extracted) {
-      final r = VehicleResult.fromExtracted(
-        v,
-        transcript: transcript,
-        date: date,
-        time: time,
-        latitude: latitude,
-        longitude: longitude,
-      );
-      if (r.plateNumber.isEmpty) continue;
-      final key = r.plateNumber.replaceAll(' ', '');
-      if (_seenPlates.contains(key)) continue;
-      _seenPlates.add(key);
-      results.add(r);
+    _transcriptSub = deepgram.onTranscript.listen((t) {
+      print('📡 [DG] final=${t.isFinal} sf=${t.speechFinal} → "${t.text}"');
+
+      if (!t.isFinal) return;
+
+      if (t.text.isNotEmpty) {
+        if (_buf.isNotEmpty) _buf.write(' ');
+        _buf.write(t.text);
+        _finalCount++;
+        print('📝 [BUF] (finals=$_finalCount) "${_buf}"');
+      }
+
+      // ✅ ابعت لـ Gemini في حالتين:
+      // 1. speechFinal (صمت مكتمل)
+      // 2. تراكم عدد كبير من finals (لو الشخص بيتكلم بدون توقف)
+      if (t.speechFinal || _finalCount >= _maxFinalsBeforeFlush) {
+        if (t.speechFinal) {
+          print('🔔 [SF] → enqueue');
+        } else {
+          print('🔔 [MAX_FINALS=$_finalCount] → enqueue مبكر');
+        }
+        _enqueue();
+      }
+    }, onError: (e) => print('❌ [DG ERROR] $e'));
+  }
+
+  // ── Enqueue ───────────────────────────────────────────────────────────────
+  void _enqueue() {
+    final raw = _buf.toString().trim();
+    _buf.clear();
+    _finalCount = 0;
+
+    if (raw.isEmpty) {
+      print('⚠️ [ENQUEUE] فاضي — skip');
+      return;
     }
-    return results;
+
+    _queue.add(raw);
+    print('📋 [QUEUE] أضاف: "$raw" | الطول: ${_queue.length}');
+    _processNext();
   }
 
-  void resetSession() {
-    _transcriptBuffer.clear();
-    _seenPlates.clear();
-    lastTranscript = '';
+  // ── processNext ───────────────────────────────────────────────────────────
+  void _processNext() {
+    if (_isProcessing) {
+      print('⏳ [QUEUE] Gemini شغال — هينتظر');
+      return;
+    }
+    if (_queue.isEmpty) return;
+
+    final chunk = _queue.removeAt(0);
+    _isProcessing = true;
+    print('🚀 [GEMINI] بنبعت: "$chunk" | متبقي في القايمة: ${_queue.length}');
+
+    _extractAndEmit(chunk).whenComplete(() {
+      _isProcessing = false;
+      print('✅ [GEMINI] انتهى — بيشيك القايمة');
+      _processNext();
+    });
   }
 
-  String _fmt(DateTime d, {required bool date}) => date
-      ? '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}'
-      : '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+  // ── استدعاء GeminiFlashService ────────────────────────────────────────────
+  Future<void> _extractAndEmit(String transcript) async {
+    try {
+      final vehicles = await _gemini.extractVehicles(transcript: transcript);
+      print('🔢 [GEMINI] عدد اللوحات: ${vehicles.length}');
+
+      for (final v in vehicles) {
+        final plate = (v['plate_number'] as String? ?? '').trim();
+        print('🎉 [OK] لوحة: "$plate" | confidence: ${v['confidence']} | status: ${v['status']}');
+        if (!_plateCtrl.isClosed) {
+          _plateCtrl.add(_build(v, transcript));
+        }
+      }
+    } catch (e) {
+      print('❌ [GEMINI] exception: $e');
+    }
+  }
+
+  // ── بناء VehicleResult ─────────────────────────────────────────────────────
+  VehicleResult _build(Map<String, dynamic> v, String transcript) {
+    final plate = (v['plate_number'] as String? ?? '').trim();
+    final status = (v['status'] as String? ?? 'ok');
+    final now = DateTime.now();
+
+    return VehicleResult(
+      id: '${now.microsecondsSinceEpoch}_$plate',
+      transcript: transcript,
+      plateNumber: plate,
+      vehicleType: (v['vehicle_type'] as String? ?? '').trim(),
+      address: (v['address'] as String? ?? '').trim(),
+      latitude: latitude,
+      longitude: longitude,
+      mapLink: (latitude != null && longitude != null)
+          ? 'https://www.google.com/maps?q=$latitude,$longitude'
+          : '',
+      date: '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
+      time: '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}',
+      status: status,
+      error: status == 'needs_review' ? 'تحتاج مراجعة' : null,
+    );
+  }
+
+  // ── Reset & Dispose ───────────────────────────────────────────────────────
+  void resetBuffer() {
+    _buf.clear();
+    _queue.clear();
+    _isProcessing = false;
+    _finalCount = 0;
+    print('🔄 [REPO] resetBuffer()');
+  }
+
+  // ✅ فضفض أي كلام متبقي في البافر بعد stop (مش استنى speechFinal)
+  void flushRemaining() {
+    if (_buf.isNotEmpty) {
+      print('🔔 [FLUSH_REMAINING] → enqueue ما تبقى في البافر');
+      _enqueue();
+    }
+  }
+
+  // ✅ استنى لحد ما القايمة تخلص تماماً
+  Future<void> waitForQueue() async {
+    if (!_isProcessing && _queue.isEmpty) return;
+    print('⏳ [WAIT] استنى القايمة تخلص...');
+    // Poll كل 100ms لحد ما يخلص
+    while (_isProcessing || _queue.isNotEmpty) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    print('✅ [WAIT] القايمة خلصت');
+  }
+
+  Future<void> dispose() async {
+    await _transcriptSub?.cancel();
+    _transcriptSub = null;
+    _buf.clear();
+    _queue.clear();
+    await _plateCtrl.close();
+    print('🔴 [REPO] disposed');
+  }
 }

@@ -3,5 +3,6 @@ import 'app.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const VehicleAiTestApp());
+  // Firebase removed — using Groq + Gemini REST APIs directly
+  runApp( VehicleAiTestApp());
 }

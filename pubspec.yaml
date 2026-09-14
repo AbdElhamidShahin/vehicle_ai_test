@@ -1,6 +1,8 @@
+# pubspec.yaml — المُحدَّث
 name: vehicle_ai_test
-description: "Vehicle voice data collection - whisper.cpp on-device + Gemini Flash Lite"
+description: "تسجيل لوحات السيارات — Deepgram Nova-2 Real-time"
 publish_to: 'none'
+
 version: 1.0.0+4
 
 environment:
@@ -12,13 +14,14 @@ dependencies:
 
   cupertino_icons: ^1.0.8
 
-  # ── On-device STT (whisper.cpp) ──────────────────────────────────────────
-  whisper_cpp_flutter_plus: ^0.4.1
+  # ✅ الميكروفون كـ PCM Stream مباشر
+  record: ^6.1.2
 
-  # ── LLM extraction ───────────────────────────────────────────────────────
+  # ✅ WebSocket يشتغل على Android + iOS + Web
+  web_socket_channel: ^3.0.3
+
+  # باقي الـ dependencies
   http: ^1.5.0
-
-  # ── Utilities ────────────────────────────────────────────────────────────
   path_provider: ^2.1.5
   share_plus: ^12.0.2
   geolocator: ^14.0.2

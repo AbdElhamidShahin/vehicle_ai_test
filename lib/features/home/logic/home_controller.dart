@@ -1,211 +1,170 @@
+// lib/features/home/logic/home_controller.dart
+
 import 'dart:async';
 import 'package:flutter/foundation.dart';
-import '../../../core/ai/whisper_on_device_service.dart';
+
+import '../../../core/ai/DeepgramLiveService.dart';
 import '../../../core/constants/app_constants.dart';
-import '../../../core/services/location_service.dart';
-import '../../../core/services/internet_service.dart';
-import '../../../core/services/map_service.dart';
-import '../../home/data/datasources/export_datasource.dart';
-import '../../home/data/models/vehicle_result.dart';
-import '../../home/data/repositories/vehicle_repository.dart';
+import '../data/models/vehicle_result.dart';
+import '../data/repositories/vehicle_repository.dart';
 
 class HomeController extends ChangeNotifier {
-  final WhisperOnDeviceService _whisper;
-  final VehicleRepository      _repo;
-  final LocationService        _location;
-  final MapService             _map;
-  final InternetService        _internet;
-  final ExportDatasource       _export;
 
-  HomeController({
-    WhisperOnDeviceService? whisper,
-    VehicleRepository?      repo,
-    LocationService?        location,
-    MapService?             map,
-    InternetService?        internet,
-    ExportDatasource?       export,
-  })  : _whisper  = whisper  ?? WhisperOnDeviceService(),
-        _repo     = repo     ?? VehicleRepository(),
-        _location = location ?? LocationService(),
-        _map      = map      ?? MapService(),
-        _internet = internet ?? InternetService(),
-        _export   = export   ?? ExportDatasource() {
-    _initWhisper();
+  // ── Services ───────────────────────────────────────────────────────────────
+  late final DeepgramLiveService _deepgram;
+  late final VehicleRepository   _repo;
+
+  StreamSubscription<VehicleResult>?      _plateSub;
+  StreamSubscription<DeepgramTranscript>? _interimSub;
+
+  HomeController() {
+    _deepgram = DeepgramLiveService(apiKey: AppConstants.deepgramApiKey);
+    _repo     = VehicleRepository(deepgram: _deepgram);
   }
 
   // ── State ──────────────────────────────────────────────────────────────────
-  final history        = <VehicleResult>[];
-  bool isRecording     = false;
-  bool isDownloading   = false;
-  bool isModelReady    = false;
-  bool isProcessing    = false;
-  double downloadProgress = 0;
-  String downloadLabel    = '';
-  String status           = 'جاري التهيئة...';
-  String liveTranscript   = '';
-  String partialTranscript = '';
-  int seconds = 0;
+  final history = <VehicleResult>[];
+  bool   isRecording  = false;
+  bool   isProcessing = false;
+  String status       = 'جاهز للتسجيل';
+  String liveText     = '';
+  String liveTranscript = '';
+  int    seconds      = 0;
 
-  double? _latitude;
-  double? _longitude;
-  Timer?  _elapsedTimer;
+  Timer? _clock;
 
   String get timeFormatted =>
       '${(seconds ~/ 60).toString().padLeft(2, '0')}:'
-      '${(seconds % 60).toString().padLeft(2, '0')}';
+          '${(seconds % 60).toString().padLeft(2, '0')}';
 
-  // ── Init ───────────────────────────────────────────────────────────────────
-  Future<void> _initWhisper() async {
-    _whisper.onStateChanged = _onWhisperState;
-    _whisper.onPartialResult = (text) {
-      partialTranscript = text;
-      notifyListeners();
-    };
-    _whisper.onFinalResult = _onFinalTranscript;
-
-    await _whisper.initialize();
-
-    if (_whisper.state == WhisperState.ready) {
-      isModelReady = true;
-      _setStatus('✅ الموديل جاهز — ابدأ التسجيل');
-    } else {
-      _setStatus('📥 يحتاج تحميل الموديل (${AppConstants.whisperModelSizeMB}MB)');
-    }
+  // ── GPS ───────────────────────────────────────────────────────────────────
+  void setLocation(double lat, double lng) {
+    _repo.latitude  = lat;
+    _repo.longitude = lng;
   }
 
-  // ── Download Model ─────────────────────────────────────────────────────────
-  Future<void> downloadModel() async {
-    if (!await _internet.hasInternet()) {
-      _setStatus('⚠️ تحتاج إنترنت لتحميل الموديل (مرة واحدة فقط)');
-      return;
-    }
-
-    isDownloading = true;
-    _setStatus('📥 جاري تحميل الموديل...');
-
-    try {
-      await _whisper.downloadModels(
-        onProgress: (progress, label) {
-          downloadProgress = progress;
-          downloadLabel    = label;
-          notifyListeners();
-        },
-      );
-      isModelReady  = true;
-      isDownloading = false;
-      _setStatus('✅ تم التحميل — ابدأ التسجيل');
-    } catch (e) {
-      isDownloading = false;
-      _setStatus('❌ فشل التحميل — تحقق من الإنترنت');
-    }
-  }
-
-  // ── Recording ──────────────────────────────────────────────────────────────
+  // ── Start ──────────────────────────────────────────────────────────────────
   Future<void> startRecording() async {
-    if (!isModelReady) { await downloadModel(); return; }
+    if (isRecording) return;
 
-    _fetchLocation();
-    _repo.resetSession();
-    liveTranscript    = '';
-    partialTranscript = '';
-    seconds           = 0;
-    isRecording       = true;
-
-    _elapsedTimer = Timer.periodic(
-      const Duration(seconds: 1),
-      (_) { seconds++; notifyListeners(); },
-    );
-
-    await _whisper.startListening();
-    _setStatus('🎙️ يسمع ويحوّل... (offline)');
-  }
-
-  Future<void> stopRecording() async {
-    _elapsedTimer?.cancel();
-    await _whisper.stopListening();
-    isRecording = false;
-    _setStatus(history.isEmpty
-        ? '⚠️ لم يتم التعرف على أي لوحة'
-        : '✅ تم — ${history.length} سيارة');
-  }
-
-  // ── Whisper Callbacks ──────────────────────────────────────────────────────
-  void _onWhisperState(WhisperState s) {
-    notifyListeners();
-  }
-
-  Future<void> _onFinalTranscript(String transcript) async {
-    liveTranscript    = transcript;
-    partialTranscript = '';
-    isProcessing      = true;
+    liveText      = '';
+    liveTranscript = '';
+    seconds       = 0;
+    _repo.resetBuffer();
     notifyListeners();
 
     try {
-      final results = await _repo.processTranscript(
-        transcript: transcript,
-        latitude:   _latitude,
-        longitude:  _longitude,
-      );
+      await _deepgram.start();
+      _repo.initialize();
 
-      if (results.isNotEmpty) {
-        history.insertAll(0, results);
-        if (isRecording) {
-          _setStatus('🎙️ آخر لوحة: ${results.first.plateNumber}');
+      // اشترك في النص الـ interim
+      _interimSub = _deepgram.onTranscript.listen((t) {
+        if (!t.isFinal) {
+          liveText      = t.text;
+          liveTranscript = t.text;
+          notifyListeners();
+        } else {
+          liveText      = '';
+          liveTranscript = '';
+          notifyListeners();
         }
-      }
-    } catch (e) {
-      if (kDebugMode) print('Extract error: $e');
-    } finally {
-      isProcessing = false;
+      });
+
+      // ✅ اشترك في اللوحات — الـ subscription يفضل شغال حتى بعد stop
+      _plateSub = _repo.plateStream.listen((result) {
+        history.insert(0, result);
+        liveText      = '';
+        liveTranscript = '';
+        status = '✅ لوحة ${result.plateNumber} — ${history.length} إجمالاً';
+        notifyListeners();
+      });
+
+      _clock = Timer.periodic(const Duration(seconds: 1), (_) {
+        seconds++;
+        notifyListeners();
+      });
+
+      isRecording = true;
+      status      = '🎙️ جاري التسجيل...';
       notifyListeners();
+
+    } catch (e) {
+      status = '❌ خطأ: $e';
+      isRecording = false;
+      notifyListeners();
+      rethrow;
     }
   }
 
-  // ── Location ───────────────────────────────────────────────────────────────
-  Future<void> _fetchLocation() async {
-    try {
-      final r  = await _location.getCurrentLocation();
-      _latitude  = r.latitude;
-      _longitude = r.longitude;
-    } catch (_) {}
+  // ── Stop ───────────────────────────────────────────────────────────────────
+  Future<void> stopRecording() async {
+    if (!isRecording) return;
+
+    _clock?.cancel();
+    _clock = null;
+
+    await _interimSub?.cancel();
+    _interimSub = null;
+
+    // ✅ أوقف الميكروفون والـ Deepgram أولاً
+    await _deepgram.stop();
+
+    // ✅ فضفض الـ buffer لو فيه كلام لسه ما اتبعتش
+    _repo.flushRemaining();
+
+    // ✅ استنى الـ queue تخلص (كل اللوحات المعلقة تتعالج)
+    isRecording   = false;
+    isProcessing  = true;
+    liveText      = '';
+    liveTranscript = '';
+    status = '⏳ جاري معالجة اللوحات المتبقية...';
+    notifyListeners();
+
+    await _repo.waitForQueue();
+
+    // ✅ بعد ما كل حاجة خلصت، الغي الـ subscription
+    await _plateSub?.cancel();
+    _plateSub = null;
+
+    isProcessing = false;
+    status = history.isEmpty
+        ? '⚠️ لم يُتعرف على أي لوحة'
+        : '✅ انتهى — ${history.length} لوحة';
+    notifyListeners();
   }
 
   // ── Edit / Delete ──────────────────────────────────────────────────────────
   void deleteItem(String id) {
     history.removeWhere((e) => e.id == id);
-    _setStatus('تم الحذف');
+    status = 'تم الحذف';
+    notifyListeners();
   }
 
-  void updateItem(VehicleResult item, {
-    required String plateNumber,
-    required String vehicleType,
-    required String address,
-  }) {
+  void updateItem(
+      VehicleResult item, {
+        required String plateNumber,
+        required String vehicleType,
+        required String address,
+      }) {
     item.plateNumber = plateNumber.trim();
     item.vehicleType = vehicleType.trim();
     item.address     = address.trim();
     item.status      = item.plateNumber.isEmpty ? 'needs_review' : 'ok';
-    item.confidence  = 'high';
-    _setStatus('✅ تم التعديل');
+    status = 'تم التعديل';
+    notifyListeners();
   }
 
-  // ── Export / Map ───────────────────────────────────────────────────────────
-  Future<bool> openMap(String url) => _map.open(url);
+  Future<void> exportToExcel() async {}
 
-  Future<void> exportToExcel() async {
-    if (history.isEmpty) { _setStatus('لا توجد بيانات'); return; }
-    try {
-      await _export.exportVehicles(history);
-      _setStatus('✅ تم التصدير');
-    } catch (_) { _setStatus('❌ فشل التصدير'); }
-  }
-
-  void _setStatus(String s) { status = s; notifyListeners(); }
+  Future<bool> openMap(String url) async => false;
 
   @override
   void dispose() {
-    _elapsedTimer?.cancel();
-    _whisper.dispose();
+    _clock?.cancel();
+    _interimSub?.cancel();
+    _plateSub?.cancel();
+    _deepgram.dispose();
+    _repo.dispose();
     super.dispose();
   }
 }

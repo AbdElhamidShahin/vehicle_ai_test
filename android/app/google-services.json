@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "494491220231",
+    "project_id": "worker-ai-app",
+    "storage_bucket": "worker-ai-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:494491220231:android:f550986dc7448ce923eda2",
+        "android_client_info": {
+          "package_name": "com.example.vehicle_ai_test"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAapjmWD9JLTLCgkPnYbszl6utUA8m2aQY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
