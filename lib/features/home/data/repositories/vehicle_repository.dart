@@ -1,236 +1,126 @@
 // lib/features/home/data/repositories/vehicle_repository.dart
 //
-// ✅ الإصلاحات:
-//   1. plateStream بقى StreamController حقيقي بدل async* generator
-//      (async* generator كان بيعمل stream جديد كل مرة بتعمل get)
-//   2. الاشتراك في deepgram.onTranscript بيتعمل مرة واحدة في initialize()
-//   3. Buffer logic مصلوح: interim بيتراكم في _buf، الـ validation بيتطبق على speechFinal فقط
-//   4. أضفنا كلمات اللهجة المصرية الشائعة في القاموس
+// ✅ بيستخدم GeminiFlashService بدل الـ regex
+// البافر بيتمسح بعد كل speechFinal دايماً
 
 import 'dart:async';
-
 import '../../../../core/ai/DeepgramLiveService.dart';
+import '../../../../core/ai/gemini_flash_service.dart';
 import '../models/vehicle_result.dart';
 
 class VehicleRepository {
   VehicleRepository({required this.deepgram});
 
   final DeepgramLiveService deepgram;
+  final _gemini = GeminiFlashService();
 
-  // ✅ StreamController حقيقي — مش async* generator
   final _plateCtrl = StreamController<VehicleResult>.broadcast();
-
-  /// اشترك هنا لاستقبال اللوحات المكتملة
   Stream<VehicleResult> get plateStream => _plateCtrl.stream;
 
   StreamSubscription<DeepgramTranscript>? _transcriptSub;
-
-  // ── Buffer ────────────────────────────────────────────────────────────────
-  // بنجمع النص حتى يجي speechFinal (أقوى إشارة من Deepgram إن الكلام خلص)
   final StringBuffer _buf = StringBuffer();
+  bool _isFlushing = false;
 
-  // ── GPS (اختياري) ─────────────────────────────────────────────────────────
   double? latitude;
   double? longitude;
 
-  // ─────────────────────────────────────────────────────────────────────────
-  /// ✅ لازم تتنادى مرة واحدة بعد ما DeepgramLiveService.start() يشتغل
+  // ── initialize ────────────────────────────────────────────────────────────
   void initialize() {
     _transcriptSub?.cancel();
+    print('🟢 [REPO] initialize()');
 
     _transcriptSub = deepgram.onTranscript.listen((t) {
-      if (t.isFinal) {
-        // ✅ بنجمع الـ final text في الـ buffer
+      print('📡 [DG] final=${t.isFinal} sf=${t.speechFinal} → "${t.text}"');
+
+      if (!t.isFinal) return;
+
+      if (t.text.isNotEmpty) {
         if (_buf.isNotEmpty) _buf.write(' ');
         _buf.write(t.text);
+        print('📝 [BUF] "${_buf}"');
+      }
 
-        // ✅ لو Deepgram قال speechFinal → حاول تستخرج اللوحة دلوقتي
-        if (t.speechFinal) {
-          _tryFlushBuffer();
+      if (t.speechFinal) {
+        print('🔔 [SF] → flush');
+        _flush();
+      }
+    }, onError: (e) => print('❌ [DG ERROR] $e'));
+  }
+
+  // ── Flush — بيتمسح البافر دايماً ─────────────────────────────────────────
+  void _flush() {
+    final raw = _buf.toString().trim();
+    _buf.clear(); // ✅ امسح دايماً أولاً
+
+    if (raw.isEmpty) {
+      print('⚠️ [FLUSH] فاضي');
+      return;
+    }
+    if (_isFlushing) {
+      print('⚠️ [FLUSH] شغال بالفعل — skip');
+      return;
+    }
+
+    _isFlushing = true;
+    print('🚀 [GEMINI] بنبعت: "$raw"');
+    _extractAndEmit(raw).whenComplete(() => _isFlushing = false);
+  }
+
+  // ── استدعاء GeminiFlashService ────────────────────────────────────────────
+  Future<void> _extractAndEmit(String transcript) async {
+    try {
+      final vehicles = await _gemini.extractVehicles(transcript: transcript);
+
+      print('🔢 [GEMINI] عدد اللوحات: ${vehicles.length}');
+
+      for (final v in vehicles) {
+        final plate = (v['plate_number'] as String? ?? '').trim();
+        print('🎉 [OK] لوحة: "$plate" | confidence: ${v['confidence']} | status: ${v['status']}');
+        if (!_plateCtrl.isClosed) {
+          _plateCtrl.add(_build(v, transcript));
         }
       }
-      // الـ interim مش بنحتاجه هنا — HomeController بيتعامل معاه للـ UI
-    });
-  }
-
-  /// ✅ حاول flush الـ buffer واستخراج لوحة منه
-  void _tryFlushBuffer() {
-    final raw = _buf.toString().trim();
-    if (raw.isEmpty) return;
-
-    final result = _tryExtractPlate(raw);
-    if (result != null) {
-      _buf.clear();
-      _plateCtrl.add(result);
+    } catch (e) {
+      print('❌ [GEMINI] exception: $e');
     }
-    // لو مش مكتمل → نكمل نجمع في الـ buffer للـ speechFinal الجاي
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  VehicleResult? _tryExtractPlate(String raw) {
-    final normalized = _normalize(raw);
-    if (normalized.isEmpty) return null;
-
-    final validated = _validate(normalized);
-    if (validated.isEmpty) return null;
-
-    return _buildResult(validated, raw);
-  }
-
-  // ── Normalization ─────────────────────────────────────────────────────────
-  String _normalize(String raw) {
-    var s = raw.trim();
-
-    // 1. أرقام عربية → إنجليزية
-    const ar = '٠١٢٣٤٥٦٧٨٩';
-    for (var i = 0; i < ar.length; i++) {
-      s = s.replaceAll(ar[i], '$i');
-    }
-
-    // 2. كلمات الأرقام → رقم (مرتبة من الأطول للأقصر علشان "تلاتة" قبل "تلات")
-    const numMap = <String, String>{
-      'صفر': '0',
-      'زيرو': '0',
-      'واحد': '1',
-      'واحده': '1',
-      'واحدة': '1',
-      'إتنين': '2',
-      'اتنين': '2',
-      'اثنين': '2',
-      'اثنان': '2',
-      'تلاتة': '3',
-      'تلاته': '3',
-      'ثلاثة': '3',
-      'ثلاثه': '3',
-      'تلات': '3',
-      'أربعة': '4',
-      'اربعة': '4',
-      'اربعه': '4',
-      'أربعه': '4',
-      'اربع': '4',
-      'أربع': '4',
-      'خمسة': '5',
-      'خمسه': '5',
-      'خمس': '5',
-      'ستة': '6',
-      'سته': '6',
-      'ست': '6',
-      'سبعة': '7',
-      'سبعه': '7',
-      'سبع': '7',
-      'ثمانية': '8',
-      'تمانية': '8',
-      'تمانيه': '8',
-      'ثمانيه': '8',
-      'تمان': '8',
-      'تسعة': '9',
-      'تسعه': '9',
-      'تسع': '9',
-    };
-
-    // رتب من الأطول للأقصر علشان نتجنب partial matches
-    final sortedNums = numMap.keys.toList()
-      ..sort((a, b) => b.length.compareTo(a.length));
-    for (final word in sortedNums) {
-      s = s.replaceAll(word, numMap[word]!);
-    }
-
-    // 3. كلمات الحروف → حرف واحد
-    const letterMap = <String, String>{
-      'ألف': 'ا',
-      'الف': 'ا',
-      'أ': 'ا',
-      'باء': 'ب',
-      'بيه': 'ب',
-      'تاء': 'ت',
-      'تيه': 'ت',
-      'ثاء': 'ث',
-      'جيم': 'ج',
-      'حاء': 'ح',
-      'حيه': 'ح',
-      'خاء': 'خ',
-      'دال': 'د',
-      'ذال': 'ذ',
-      'راء': 'ر',
-      'زاي': 'ز',
-      'سين': 'س',
-      'شين': 'ش',
-      'صاد': 'ص',
-      'ضاد': 'ض',
-      'طاء': 'ط',
-      'ظاء': 'ظ',
-      'عين': 'ع',
-      'غين': 'غ',
-      'فاء': 'ف',
-      'قاف': 'ق',
-      'كاف': 'ك',
-      'لام': 'ل',
-      'ميم': 'م',
-      'نون': 'ن',
-      'هاء': 'ه',
-      'واو': 'و',
-      'ياء': 'ي',
-    };
-
-    // رتب من الأطول للأقصر
-    final sortedLetters = letterMap.keys.toList()
-      ..sort((a, b) => b.length.compareTo(a.length));
-    for (final word in sortedLetters) {
-      s = s.replaceAll(word, letterMap[word]!);
-    }
-
-    // 4. نظّف المسافات
-    s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
-
-    return s;
-  }
-
-  // ── Validation: بالضبط 3 حروف عربية + 4 أرقام ─────────────────────────────
-  String _validate(String s) {
-    final arabicChars =
-    RegExp(r'[\u0600-\u06FF]').allMatches(s).map((m) => m[0]!).toList();
-    final digits =
-    RegExp(r'\d').allMatches(s).map((m) => m[0]!).toList();
-
-    // ✅ الشرط الصارم: بالضبط 3 حروف و 4 أرقام — لا أكثر لا أقل
-    if (arabicChars.length != 3 || digits.length != 4) return '';
-
-    // صيغة اللوحة النهائية: "م ن س 1234"
-    return '${arabicChars.join(' ')} ${digits.join('')}';
-  }
-
-  // ── بناء VehicleResult ────────────────────────────────────────────────────
-  VehicleResult _buildResult(String plate, String rawTranscript) {
+  // ── بناء VehicleResult ─────────────────────────────────────────────────────
+  VehicleResult _build(Map<String, dynamic> v, String transcript) {
+    final plate = (v['plate_number'] as String? ?? '').trim();
+    final status = (v['status'] as String? ?? 'ok');
     final now = DateTime.now();
-    final date =
-        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-    final time =
-        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
     return VehicleResult(
       id: '${now.microsecondsSinceEpoch}_$plate',
+      transcript: transcript,
       plateNumber: plate,
-      vehicleType: '',
-      address: '',
-      transcript: rawTranscript,
+      vehicleType: (v['vehicle_type'] as String? ?? '').trim(),
+      address: (v['address'] as String? ?? '').trim(),
       latitude: latitude,
       longitude: longitude,
-      mapLink: latitude != null && longitude != null
+      mapLink: (latitude != null && longitude != null)
           ? 'https://www.google.com/maps?q=$latitude,$longitude'
           : '',
-      date: date,
-      time: time,
-      status: 'ok',
+      date: '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}',
+      time: '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}',
+      status: status,
+      error: status == 'needs_review' ? 'تحتاج مراجعة' : null,
     );
   }
 
   // ── Reset & Dispose ───────────────────────────────────────────────────────
-  void resetBuffer() => _buf.clear();
+  void resetBuffer() {
+    _buf.clear();
+    _isFlushing = false;
+    print('🔄 [REPO] resetBuffer()');
+  }
 
   Future<void> dispose() async {
     await _transcriptSub?.cancel();
     _transcriptSub = null;
     _buf.clear();
     await _plateCtrl.close();
+    print('🔴 [REPO] disposed');
   }
 }

@@ -35,27 +35,26 @@ class DeepgramLiveService {
     // بنبني الـ URI بـ Uri.parse على string ثابتة — مش Uri() constructor
     final uri = Uri.parse(
       'wss://api.deepgram.com/v1/listen'
-          '?model=nova-2'
-          '&language=ar'
-          '&encoding=linear16'
-          '&sample_rate=16000'
-          '&channels=1'
-          '&interim_results=true'
-          '&endpointing=300'
-          '&punctuate=false',
+      '?model=nova-3'
+      '&language=ar'
+      '&encoding=linear16'
+      '&sample_rate=16000'
+      '&channels=1'
+      '&interim_results=true'
+      '&endpointing=300'
+      '&punctuate=false',
     );
 
     try {
-      _channel = WebSocketChannel.connect(
-        uri,
-        protocols: ['token', apiKey],
-      );
+      _channel = WebSocketChannel.connect(uri, protocols: ['token', apiKey]);
 
       await _channel!.ready;
 
       _wsSub = _channel!.stream.listen(
         _onWsMessage,
-        onError: (e) { if (!_ctrl.isClosed) _ctrl.addError(e); },
+        onError: (e) {
+          if (!_ctrl.isClosed) _ctrl.addError(e);
+        },
         onDone: _onWsDone,
         cancelOnError: false,
       );
@@ -72,15 +71,16 @@ class DeepgramLiveService {
       ),
     );
 
-    _audioSub = audioStream.listen(
-          (Uint8List chunk) {
-        try { _channel?.sink.add(chunk); } catch (_) {}
-      },
-      cancelOnError: false,
-    );
+    _audioSub = audioStream.listen((Uint8List chunk) {
+      try {
+        _channel?.sink.add(chunk);
+      } catch (_) {}
+    }, cancelOnError: false);
 
     _keepAliveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      try { _channel?.sink.add(jsonEncode({'type': 'KeepAlive'})); } catch (_) {}
+      try {
+        _channel?.sink.add(jsonEncode({'type': 'KeepAlive'}));
+      } catch (_) {}
     });
 
     _running = true;
@@ -95,7 +95,9 @@ class DeepgramLiveService {
 
     await _audioSub?.cancel();
     _audioSub = null;
-    try { await _recorder.stop(); } catch (_) {}
+    try {
+      await _recorder.stop();
+    } catch (_) {}
 
     try {
       _channel?.sink.add(jsonEncode({'type': 'CloseStream'}));
@@ -104,7 +106,9 @@ class DeepgramLiveService {
 
     await _wsSub?.cancel();
     _wsSub = null;
-    try { await _channel?.sink.close(); } catch (_) {}
+    try {
+      await _channel?.sink.close();
+    } catch (_) {}
     _channel = null;
   }
 
@@ -126,16 +130,20 @@ class DeepgramLiveService {
 
       if (text.isEmpty) return;
       if (!_ctrl.isClosed) {
-        _ctrl.add(DeepgramTranscript(
-          text: text,
-          isFinal: isFinal,
-          speechFinal: speechFinal,
-        ));
+        _ctrl.add(
+          DeepgramTranscript(
+            text: text,
+            isFinal: isFinal,
+            speechFinal: speechFinal,
+          ),
+        );
       }
     } catch (_) {}
   }
 
-  void _onWsDone() { _running = false; }
+  void _onWsDone() {
+    _running = false;
+  }
 
   Future<void> dispose() async {
     await stop();
