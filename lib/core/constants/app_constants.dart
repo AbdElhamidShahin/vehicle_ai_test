@@ -1,8 +1,6 @@
 class AppConstants {
   AppConstants._();
 
-
-
   // ── Deepgram — Real-time STT ──────────────────────────────────────────────
   static const deepgramApiKey = String.fromEnvironment(
     'DEEPGRAM_API_KEY',

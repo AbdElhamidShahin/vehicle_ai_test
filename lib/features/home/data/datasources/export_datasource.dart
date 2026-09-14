@@ -18,7 +18,7 @@ class ExportDatasource {
         'الوقت',
       ],
       ...vehicles.map(
-        (v) => [
+            (v) => [
           v.plateNumber,
           v.vehicleType,
           v.address,
