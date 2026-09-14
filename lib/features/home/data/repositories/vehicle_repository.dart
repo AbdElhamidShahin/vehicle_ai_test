@@ -1,7 +1,10 @@
 // lib/features/home/data/repositories/vehicle_repository.dart
 //
-// ✅ بيستخدم GeminiFlashService بدل الـ regex
-// البافر بيتمسح بعد كل speechFinal دايماً
+// ✅ الإصلاحات:
+//   1. Queue بدل skip — مفيش chunk بيتضيع
+//   2. كل final transcript بيتبعت لـ Gemini مستقل (مش بس speechFinal)
+//      — لإن speechFinal ممكن تيجي مرة واحدة لكل اللوحات مع بعض
+//   3. الـ buffer بيتمسح بعد كل final للتقليل من التراكم
 
 import 'dart:async';
 import '../../../../core/ai/DeepgramLiveService.dart';
@@ -18,8 +21,17 @@ class VehicleRepository {
   Stream<VehicleResult> get plateStream => _plateCtrl.stream;
 
   StreamSubscription<DeepgramTranscript>? _transcriptSub;
+
+  // ✅ Queue بدل _isFlushing flag
+  final _queue = <String>[];
+  bool _isProcessing = false;
+
+  // Buffer للـ interim finals قبل speechFinal
   final StringBuffer _buf = StringBuffer();
-  bool _isFlushing = false;
+
+  // عدد finals المتراكمة (لو وصلت حد معين نبعت حتى لو مفيش speechFinal)
+  int _finalCount = 0;
+  static const int _maxFinalsBeforeFlush = 3; // ابعت كل 3 finals
 
   double? latitude;
   double? longitude;
@@ -37,40 +49,63 @@ class VehicleRepository {
       if (t.text.isNotEmpty) {
         if (_buf.isNotEmpty) _buf.write(' ');
         _buf.write(t.text);
-        print('📝 [BUF] "${_buf}"');
+        _finalCount++;
+        print('📝 [BUF] (finals=$_finalCount) "${_buf}"');
       }
 
-      if (t.speechFinal) {
-        print('🔔 [SF] → flush');
-        _flush();
+      // ✅ ابعت لـ Gemini في حالتين:
+      // 1. speechFinal (صمت مكتمل)
+      // 2. تراكم عدد كبير من finals (لو الشخص بيتكلم بدون توقف)
+      if (t.speechFinal || _finalCount >= _maxFinalsBeforeFlush) {
+        if (t.speechFinal) {
+          print('🔔 [SF] → enqueue');
+        } else {
+          print('🔔 [MAX_FINALS=$_finalCount] → enqueue مبكر');
+        }
+        _enqueue();
       }
     }, onError: (e) => print('❌ [DG ERROR] $e'));
   }
 
-  // ── Flush — بيتمسح البافر دايماً ─────────────────────────────────────────
-  void _flush() {
+  // ── Enqueue ───────────────────────────────────────────────────────────────
+  void _enqueue() {
     final raw = _buf.toString().trim();
-    _buf.clear(); // ✅ امسح دايماً أولاً
+    _buf.clear();
+    _finalCount = 0;
 
     if (raw.isEmpty) {
-      print('⚠️ [FLUSH] فاضي');
-      return;
-    }
-    if (_isFlushing) {
-      print('⚠️ [FLUSH] شغال بالفعل — skip');
+      print('⚠️ [ENQUEUE] فاضي — skip');
       return;
     }
 
-    _isFlushing = true;
-    print('🚀 [GEMINI] بنبعت: "$raw"');
-    _extractAndEmit(raw).whenComplete(() => _isFlushing = false);
+    _queue.add(raw);
+    print('📋 [QUEUE] أضاف: "$raw" | الطول: ${_queue.length}');
+    _processNext();
+  }
+
+  // ── processNext ───────────────────────────────────────────────────────────
+  void _processNext() {
+    if (_isProcessing) {
+      print('⏳ [QUEUE] Gemini شغال — هينتظر');
+      return;
+    }
+    if (_queue.isEmpty) return;
+
+    final chunk = _queue.removeAt(0);
+    _isProcessing = true;
+    print('🚀 [GEMINI] بنبعت: "$chunk" | متبقي في القايمة: ${_queue.length}');
+
+    _extractAndEmit(chunk).whenComplete(() {
+      _isProcessing = false;
+      print('✅ [GEMINI] انتهى — بيشيك القايمة');
+      _processNext();
+    });
   }
 
   // ── استدعاء GeminiFlashService ────────────────────────────────────────────
   Future<void> _extractAndEmit(String transcript) async {
     try {
       final vehicles = await _gemini.extractVehicles(transcript: transcript);
-
       print('🔢 [GEMINI] عدد اللوحات: ${vehicles.length}');
 
       for (final v in vehicles) {
@@ -112,14 +147,36 @@ class VehicleRepository {
   // ── Reset & Dispose ───────────────────────────────────────────────────────
   void resetBuffer() {
     _buf.clear();
-    _isFlushing = false;
+    _queue.clear();
+    _isProcessing = false;
+    _finalCount = 0;
     print('🔄 [REPO] resetBuffer()');
+  }
+
+  // ✅ فضفض أي كلام متبقي في البافر بعد stop (مش استنى speechFinal)
+  void flushRemaining() {
+    if (_buf.isNotEmpty) {
+      print('🔔 [FLUSH_REMAINING] → enqueue ما تبقى في البافر');
+      _enqueue();
+    }
+  }
+
+  // ✅ استنى لحد ما القايمة تخلص تماماً
+  Future<void> waitForQueue() async {
+    if (!_isProcessing && _queue.isEmpty) return;
+    print('⏳ [WAIT] استنى القايمة تخلص...');
+    // Poll كل 100ms لحد ما يخلص
+    while (_isProcessing || _queue.isNotEmpty) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    print('✅ [WAIT] القايمة خلصت');
   }
 
   Future<void> dispose() async {
     await _transcriptSub?.cancel();
     _transcriptSub = null;
     _buf.clear();
+    _queue.clear();
     await _plateCtrl.close();
     print('🔴 [REPO] disposed');
   }

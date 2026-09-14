@@ -1,11 +1,4 @@
 // lib/features/home/logic/home_controller.dart
-//
-// ✅ الإصلاحات:
-//   1. استدعاء _repo.initialize() بعد _deepgram.start() مباشرةً
-//   2. الـ _interimSub بيستمع للـ interim فقط (مش isFinal) للعرض في الـ UI
-//   3. الـ _plateSub بيستمع لـ _repo.plateStream (StreamController حقيقي)
-//   4. liveText بيتمسح لما تيجي لوحة مكتملة
-//   5. الـ API key بييجي من AppConstants بدل hardcoded string فارغ
 
 import 'dart:async';
 import 'package:flutter/foundation.dart';
@@ -25,7 +18,6 @@ class HomeController extends ChangeNotifier {
   StreamSubscription<DeepgramTranscript>? _interimSub;
 
   HomeController() {
-    // ✅ الـ API key من AppConstants (مش hardcoded)
     _deepgram = DeepgramLiveService(apiKey: AppConstants.deepgramApiKey);
     _repo     = VehicleRepository(deepgram: _deepgram);
   }
@@ -33,10 +25,10 @@ class HomeController extends ChangeNotifier {
   // ── State ──────────────────────────────────────────────────────────────────
   final history = <VehicleResult>[];
   bool   isRecording  = false;
-  bool   isProcessing = false; // للتوافق مع RecorderCard الموجود
+  bool   isProcessing = false;
   String status       = 'جاهز للتسجيل';
-  String liveText     = '';   // النص الـ interim يظهر وأنت بتتكلم
-  String liveTranscript = ''; // للتوافق مع RecorderCard القديم
+  String liveText     = '';
+  String liveTranscript = '';
   int    seconds      = 0;
 
   Timer? _clock;
@@ -62,28 +54,23 @@ class HomeController extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // 1. فتح الـ WebSocket + بدء الميكروفون
       await _deepgram.start();
-
-      // ✅ 2. بعد ما الـ service اشتغل، نربط الـ repository بالـ stream
       _repo.initialize();
 
-      // 3. اشترك في النص الـ interim (للعرض الفوري في الـ UI)
+      // اشترك في النص الـ interim
       _interimSub = _deepgram.onTranscript.listen((t) {
         if (!t.isFinal) {
-          // ✅ بس الـ interim يظهر — الـ final بيتعالج في الـ repository
           liveText      = t.text;
-          liveTranscript = t.text; // للتوافق مع RecorderCard
+          liveTranscript = t.text;
           notifyListeners();
         } else {
-          // لما تيجي نتيجة final، امسح الـ live text (اللوحة هتظهر في الـ history)
           liveText      = '';
           liveTranscript = '';
           notifyListeners();
         }
       });
 
-      // 4. اشترك في اللوحات المكتملة
+      // ✅ اشترك في اللوحات — الـ subscription يفضل شغال حتى بعد stop
       _plateSub = _repo.plateStream.listen((result) {
         history.insert(0, result);
         liveText      = '';
@@ -92,7 +79,6 @@ class HomeController extends ChangeNotifier {
         notifyListeners();
       });
 
-      // 5. عداد الوقت
       _clock = Timer.periodic(const Duration(seconds: 1), (_) {
         seconds++;
         notifyListeners();
@@ -120,15 +106,27 @@ class HomeController extends ChangeNotifier {
     await _interimSub?.cancel();
     _interimSub = null;
 
+    // ✅ أوقف الميكروفون والـ Deepgram أولاً
+    await _deepgram.stop();
+
+    // ✅ فضفض الـ buffer لو فيه كلام لسه ما اتبعتش
+    _repo.flushRemaining();
+
+    // ✅ استنى الـ queue تخلص (كل اللوحات المعلقة تتعالج)
+    isRecording   = false;
+    isProcessing  = true;
+    liveText      = '';
+    liveTranscript = '';
+    status = '⏳ جاري معالجة اللوحات المتبقية...';
+    notifyListeners();
+
+    await _repo.waitForQueue();
+
+    // ✅ بعد ما كل حاجة خلصت، الغي الـ subscription
     await _plateSub?.cancel();
     _plateSub = null;
 
-    await _deepgram.stop();
-
-    isRecording   = false;
-    isProcessing  = false;
-    liveText      = '';
-    liveTranscript = '';
+    isProcessing = false;
     status = history.isEmpty
         ? '⚠️ لم يُتعرف على أي لوحة'
         : '✅ انتهى — ${history.length} لوحة';
@@ -156,15 +154,9 @@ class HomeController extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ── Export (للتوافق مع HistorySection) ────────────────────────────────────
-  Future<void> exportToExcel() async {
-    // TODO: اربطه بـ export_datasource.dart
-  }
+  Future<void> exportToExcel() async {}
 
-  Future<bool> openMap(String url) async {
-    // TODO: استخدم url_launcher
-    return false;
-  }
+  Future<bool> openMap(String url) async => false;
 
   @override
   void dispose() {

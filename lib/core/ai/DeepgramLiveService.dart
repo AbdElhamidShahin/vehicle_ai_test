@@ -24,6 +24,17 @@ class DeepgramLiveService {
 
   Timer? _keepAliveTimer;
 
+  static const _keyterms = <String>[
+    'ألف', 'الف', 'باء', 'با', 'بي', 'تاء', 'تا', 'ثاء', 'ثا',
+    'جيم', 'جي', 'حاء', 'حا', 'خاء', 'خا', 'دال', 'دا', 'ذال', 'ذا',
+    'راء', 'را', 'راس', 'زاي', 'زي', 'سين', 'سي', 'شين', 'شي',
+    'صاد', 'صا', 'ضاد', 'ضا', 'طاء', 'طا', 'ظاء', 'ظا', 'عين', 'عي',
+    'غين', 'غي', 'فاء', 'فا', 'قاف', 'قا', 'كاف', 'كا', 'لام', 'لا',
+    'ميم', 'مي', 'نون', 'نو', 'هاء', 'ها', 'واو', 'وا', 'ياء', 'يا',
+    'صفر', 'واحد', 'اتنين', 'اثنين', 'تلاتة', 'ثلاثة', 'أربعة', 'اربعة',
+    'خمسة', 'ستة', 'سبعة', 'تمانية', 'ثمانية', 'تسعة',
+  ];
+
   Future<void> start() async {
     if (_running) return;
     if (apiKey.isEmpty) throw StateError('Deepgram API key فارغ');
@@ -31,23 +42,26 @@ class DeepgramLiveService {
       throw StateError('صلاحية الميكروفون مرفوضة');
     }
 
-    // ✅ web_socket_channel بيتعامل مع wss:// صح على Android
-    // بنبني الـ URI بـ Uri.parse على string ثابتة — مش Uri() constructor
+    final keytermQuery = _keyterms
+        .map((term) => 'keyterm=${Uri.encodeQueryComponent(term)}')
+        .join('&');
+
     final uri = Uri.parse(
       'wss://api.deepgram.com/v1/listen'
       '?model=nova-3'
-      '&language=ar'
+      '&language=ar-EG'
       '&encoding=linear16'
       '&sample_rate=16000'
       '&channels=1'
       '&interim_results=true'
       '&endpointing=300'
-      '&punctuate=false',
+      '&punctuate=false'
+      '&smart_format=false'
+      '&$keytermQuery',
     );
 
     try {
       _channel = WebSocketChannel.connect(uri, protocols: ['token', apiKey]);
-
       await _channel!.ready;
 
       _wsSub = _channel!.stream.listen(
@@ -99,9 +113,16 @@ class DeepgramLiveService {
       await _recorder.stop();
     } catch (_) {}
 
+    // Ask Deepgram to flush buffered audio before closing the socket. This is
+    // important for the very last plate in a recording.
+    try {
+      _channel?.sink.add(jsonEncode({'type': 'Finalize'}));
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    } catch (_) {}
+
     try {
       _channel?.sink.add(jsonEncode({'type': 'CloseStream'}));
-      await Future<void>.delayed(const Duration(milliseconds: 400));
+      await Future<void>.delayed(const Duration(milliseconds: 100));
     } catch (_) {}
 
     await _wsSub?.cancel();
@@ -124,9 +145,11 @@ class DeepgramLiveService {
       final alts = channel?['alternatives'] as List<dynamic>?;
       if (alts == null || alts.isEmpty) return;
 
-      final text = (alts[0]['transcript'] as String? ?? '').trim();
+      final firstAlt = alts.first as Map<String, dynamic>;
+      final text = (firstAlt['transcript'] as String? ?? '').trim();
       final isFinal = data['is_final'] as bool? ?? false;
       final speechFinal = data['speech_final'] as bool? ?? false;
+      final confidence = (firstAlt['confidence'] as num?)?.toDouble();
 
       if (text.isEmpty) return;
       if (!_ctrl.isClosed) {
@@ -135,6 +158,7 @@ class DeepgramLiveService {
             text: text,
             isFinal: isFinal,
             speechFinal: speechFinal,
+            confidence: confidence,
           ),
         );
       }
@@ -157,8 +181,11 @@ class DeepgramTranscript {
     required this.text,
     required this.isFinal,
     this.speechFinal = false,
+    this.confidence,
   });
+
   final String text;
   final bool isFinal;
   final bool speechFinal;
+  final double? confidence;
 }
