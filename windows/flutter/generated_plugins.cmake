@@ -4,9 +4,7 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   geolocator_windows
-  record_windows
   share_plus
-  speech_to_text_windows
   url_launcher_windows
 )
 

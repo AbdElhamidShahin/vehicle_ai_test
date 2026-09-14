@@ -1,8 +1,7 @@
 name: vehicle_ai_test
-description: "Prototype: voice-based vehicle data entry, direct Gemini API."
+description: "Vehicle voice data collection - whisper.cpp on-device + Gemini Flash Lite"
 publish_to: 'none'
-
-version: 1.0.0+1
+version: 1.0.0+4
 
 environment:
   sdk: ^3.8.1
@@ -12,14 +11,19 @@ dependencies:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
-  record: ^6.1.2        # audio recording
-  http: ^1.5.0          # REST calls to Gemini
-  path_provider: ^2.1.5 # temp directory for audio file
+
+  # ── On-device STT (whisper.cpp) ──────────────────────────────────────────
+  whisper_cpp_flutter_plus: ^0.4.1
+
+  # ── LLM extraction ───────────────────────────────────────────────────────
+  http: ^1.5.0
+
+  # ── Utilities ────────────────────────────────────────────────────────────
+  path_provider: ^2.1.5
   share_plus: ^12.0.2
   geolocator: ^14.0.2
   url_launcher: ^6.3.2
-  web_socket_channel: ^3.0.3
-  speech_to_text: ^7.4.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
